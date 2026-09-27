@@ -11,6 +11,13 @@ def base_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def self_command():
+    """How to start this program again (for helper processes)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "vidaudcont"]
+
+
 def models_dir():
     return os.environ.get("VIDAUDCONT_MODELS") or os.path.join(base_dir(), "models")
 

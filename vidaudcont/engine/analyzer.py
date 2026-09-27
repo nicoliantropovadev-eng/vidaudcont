@@ -6,9 +6,12 @@ Pipeline for one file:
   + accent vote (CommonAccent ECAPA) + topic hint (Whisper excerpts + medical vocabulary).
 The rules and thresholds were tuned against the user's manual cut lists (sheet rows 5-69).
 """
+import json
 import math
 import os
+import platform
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import Counter
@@ -157,6 +160,10 @@ class Models:
         torch.set_num_threads(self.threads)
         self._lock = threading.Lock()
         self._vad = self._tagger = self._accent = self._asr = None
+        # On Intel Macs torch (LLVM OpenMP) and CTranslate2 (Intel OpenMP) cannot share a process:
+        # the transcription runs in a separate process of this same program there.
+        self.asr_in_subprocess = ((sys.platform == "darwin" and platform.machine() == "x86_64")
+                                  or os.environ.get("VIDAUDCONT_ASR_SUBPROCESS") == "1")
 
     def vad(self):
         with self._lock:
@@ -457,19 +464,40 @@ def accent_vote(models, wav16, chunks, max_chunks=80):
             "top": groups.most_common(1)[0][0], "non_british": other}
 
 
+def transcribe(model, clips):
+    """Whisper text of each clip (16 kHz float32 arrays)."""
+    out = []
+    for clip in clips:
+        seg_iter, _ = model.transcribe(clip, language="en", beam_size=1, vad_filter=False,
+                                       condition_on_previous_text=False)
+        out.append(" ".join(x.text.strip() for x in seg_iter))
+    return out
+
+
+def _transcribe_in_subprocess(models, clips):
+    with tempfile.TemporaryDirectory(prefix="vidaudcont-asr-") as d:
+        src, dst = os.path.join(d, "clips.npz"), os.path.join(d, "texts.json")
+        np.savez(src, *clips)
+        cmd = resources.self_command() + ["--transcribe-clips", src, dst, "--threads", str(models.threads)]
+        r = resources.run(cmd, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0 or not os.path.exists(dst):
+            raise RuntimeError(f"расшифровка не удалась (код {r.returncode}): {(r.stderr or '')[-300:]}")
+        with open(dst, encoding="utf-8") as f:
+            return json.load(f)
+
+
 def transcribe_excerpts(models, wav16, dur, segs, n_excerpts=4, excerpt=45.0):
     if not segs:
         return ""
-    model = models.asr()
-    texts = []
+    starts, clips = [], []
     for k in range(n_excerpts):
         c = dur * (k + 0.5) / n_excerpts
         s = max(0.0, c - excerpt / 2)
         e = min(dur, s + excerpt)
-        seg_iter, _ = model.transcribe(wav16[int(s * 16000):int(e * 16000)], language="en", beam_size=1,
-                                       vad_filter=False, condition_on_previous_text=False)
-        texts.append(f"[{fmt_time(s)}] " + " ".join(x.text.strip() for x in seg_iter))
-    return "\n".join(texts)
+        starts.append(s)
+        clips.append(np.ascontiguousarray(wav16[int(s * 16000):int(e * 16000)], dtype=np.float32))
+    texts = _transcribe_in_subprocess(models, clips) if models.asr_in_subprocess else transcribe(models.asr(), clips)
+    return "\n".join(f"[{fmt_time(s)}] {t}" for s, t in zip(starts, texts))
 
 
 def analyze(path, models, settings=None, progress=None, cancelled=None):
