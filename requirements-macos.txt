@@ -1,0 +1,15 @@
+# macOS (Apple Silicon and Intel): torch 2.2.2 is the last release with Intel Mac wheels;
+# versions chosen so both builds run on macOS 12+ (see scripts in the workflow: wheels are
+# downloaded for the oldest supported macOS, not for the build machine)
+torch==2.2.2
+torchaudio==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+silero-vad==6.2.3
+speechbrain==1.1.1
+ctranslate2==4.8.2
+tokenizers==0.23.2
+av==13.1.0
+huggingface-hub==0.36.0
+tqdm==4.67.1
+PySide6-Essentials==6.7.3

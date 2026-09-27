@@ -1,0 +1,9 @@
+/models/
+/bin/
+/build/
+/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.part
+.vidaudcont-*/

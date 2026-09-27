@@ -1,0 +1,133 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            requirements: requirements.txt
+            artifact: VidAudCont-Windows
+          - name: Mac-AppleSilicon
+            os: macos-14
+            requirements: requirements-macos.txt
+            wheel_platform: macosx_12_0_arm64
+            artifact: VidAudCont-Mac-AppleSilicon
+          - name: Mac-Intel
+            os: macos-15-intel
+            requirements: requirements-macos.txt
+            wheel_platform: macosx_11_0_x86_64
+            artifact: VidAudCont-Mac-Intel
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ${{ matrix.requirements }}
+          pip install --no-deps -r requirements-nodeps.txt
+          pip install -r requirements-build.txt
+
+      - name: Install dependencies (macOS, wheels for the oldest supported macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip install --upgrade pip
+          # wheels are chosen for the oldest supported macOS, not for the (newer) build machine
+          pip download --only-binary=:all: --platform ${{ matrix.wheel_platform }} --python-version 3.12 \
+              --implementation cp -d wheels -r ${{ matrix.requirements }}
+          pip install --no-index --find-links wheels -r ${{ matrix.requirements }}
+          pip install --no-deps -r requirements-nodeps.txt
+          pip install -r requirements-build.txt
+          python -c "import torch, numpy, PySide6; print(torch.__version__, numpy.__version__, PySide6.__version__)"
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-${{ hashFiles('scripts/fetch_models.py') }}
+
+      - name: Fetch models and ffmpeg (pinned, checksums verified)
+        run: |
+          python scripts/fetch_models.py
+          python scripts/fetch_ffmpeg.py
+
+      - name: Unit tests (lossless cutting in all formats, timecodes, window)
+        run: python -m pytest tests -q -p no:cacheprovider
+
+      - name: Build
+        run: pyinstaller vidaudcont.spec --noconfirm
+
+      - name: Self-test of the built app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\VidAudCont\VidAudCont.exe" -ArgumentList "--selftest-gui","--json","selftest.json" -Wait -PassThru
+          Get-Content selftest.json -Encoding utf8
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Self-test of the built app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dist/VidAudCont.app/Contents/MacOS/VidAudCont --selftest-gui --json selftest.json
+          cat selftest.json
+          # which macOS the bundle needs: the newest minimum among all bundled binaries
+          find dist/VidAudCont.app -type f \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) -print0 \
+            | xargs -0 otool -l 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; f=0}' | sort -V | tail -1 \
+            | xargs -I{} echo "minimum macOS: {}"
+
+      - name: Zip (Windows)
+        if: runner.os == 'Windows'
+        run: 7z a -tzip -mx=5 "${{ matrix.artifact }}.zip" ".\dist\VidAudCont"
+
+      - name: Zip (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/VidAudCont.app "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-${{ matrix.name }}
+          path: selftest.json
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: VidAudCont-*
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip

@@ -1,0 +1,13 @@
+# Windows (and the Linux dev build). faster-whisper is installed separately with --no-deps:
+# its onnxruntime dependency is only used for a VAD option this app does not use.
+torch==2.14.0
+torchaudio==2.11.0
+numpy==2.5.3
+silero-vad==6.2.3
+speechbrain==1.1.1
+ctranslate2==4.8.2
+tokenizers==0.23.2
+av==18.1.0
+huggingface-hub==1.33.0
+tqdm==4.70.1
+PySide6-Essentials==6.11.2

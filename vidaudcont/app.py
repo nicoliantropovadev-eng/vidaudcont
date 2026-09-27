@@ -1,0 +1,156 @@
+"""Entry point: the window by default; --analyze / --cut / --selftest for the command line and CI."""
+import argparse
+import json
+import os
+import platform
+import shutil
+import sys
+import tempfile
+import time
+import traceback
+
+# torch and CTranslate2 both ship Intel OpenMP on Windows; without this the second copy aborts the process
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+from . import __version__, cutter, resources  # noqa: E402
+from .timecodes import parse  # noqa: E402
+
+
+def _log_file():
+    d = os.path.join(tempfile.gettempdir(), "VidAudCont")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "vidaudcont.log")
+
+
+def run_gui(files=()):
+    from PySide6.QtWidgets import QApplication
+
+    from .gui.main_window import MainWindow
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    app.setApplicationName("VidAudCont")
+    app.setOrganizationName("VidAudCont")
+    w = MainWindow()
+    w.show()
+    if files:
+        w.add_paths(list(files))
+    return app.exec()
+
+
+def selftest(out_json=None, gui=False):
+    """Everything the packaged app needs, on a known clip. Exit code 0 = all good."""
+    from .engine.analyzer import Models, analyze
+    res = {"version": __version__, "platform": platform.platform(), "python": sys.version.split()[0], "checks": []}
+    ok = True
+
+    def check(name, cond, detail=""):
+        nonlocal ok
+        ok &= bool(cond)
+        res["checks"].append({"name": name, "ok": bool(cond), "detail": str(detail)[:500]})
+        print(("OK   " if cond else "FAIL ") + name + (f"  [{detail}]" if detail else ""), flush=True)
+
+    t0 = time.time()
+    tmp = tempfile.mkdtemp(prefix="vidaudcont-selftest-")
+    try:
+        check("ffmpeg", os.path.exists(resources.tool("ffmpeg")), resources.tool("ffmpeg"))
+        check("ffprobe", os.path.exists(resources.tool("ffprobe")), resources.tool("ffprobe"))
+        src = os.path.join(tmp, "selftest клип.m4a")  # non-ASCII path on purpose
+        shutil.copy(resources.asset("selftest.m4a"), src)
+
+        t = time.time()
+        r = analyze(src, Models())
+        res["analysis_seconds"] = round(time.time() - t, 1)
+        res["timecodes"] = r["timecodes"]
+        cuts = r["cuts"]
+
+        def cover(a, b):
+            return sum(max(0.0, min(b, c["end"]) - max(a, c["start"])) for c in cuts) / (b - a)
+
+        for a, b in [(0, 5), (30, 40), (55, 60), (72, 76)]:
+            check(f"найден вырез {a}-{b} с", cover(a, b) >= 0.8, f"покрыто {cover(a, b):.0%}")
+        for a, b in [(5, 30), (40, 52), (60, 72)]:
+            check(f"речь {a}-{b} с сохранена", cover(a, b) <= 0.2, f"вырезано {cover(a, b):.0%}")
+        check("акцент британский", r["accent"] and r["accent"]["top"] == "британский", r["accent"] and r["accent"]["groups"])
+        check("расшифровка для темы", bool(r["transcript"].strip()), r["transcript"][:80])
+
+        rep = cutter.cut(src, [(c["start"], c["end"]) for c in cuts])
+        check("вырезание m4a без потерь", rep["verification"]["lossless"], rep["verification"])
+        check("длительность после вырезания", abs(rep["output_duration"] - rep["expected_duration"]) < 0.2,
+              f"{rep['output_duration']:.2f} vs {rep['expected_duration']:.2f}")
+
+        ff = resources.tool("ffmpeg")
+        flac = os.path.join(tmp, "lossless.flac")
+        resources.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "flac", flac], check=True)
+        rep = cutter.cut(flac, [(0, 5), (30, 40)])
+        check("вырезание flac до отсчёта", rep["verification"]["lossless"], rep["verification"])
+
+        vid = os.path.join(tmp, "video.mp4")
+        resources.run([ff, "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=30:size=320x240:rate=25",
+                       "-i", src, "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "5", "-g", "25", "-bf", "2",
+                       "-c:a", "copy", "-t", "30", vid], check=True)
+        rep = cutter.cut(vid, [(0, 3), (12, 19.5)], mode="video")
+        check("вырезание видео без перекодирования", rep["verification"]["lossless"], rep["verification"])
+        rep = cutter.cut(vid, [(0, 3), (12, 19.5)], mode="audio")
+        check("звук из видео без потерь", rep["verification"]["lossless"] and rep["output"].endswith(".m4a"),
+              rep["verification"])
+        check("разбор таймкодов", parse("start-0:13, 3:10-3:17, 6:35-end", 400) == [(0, 13), (190, 197), (395, 400)])
+
+        if gui:
+            from PySide6.QtWidgets import QApplication
+
+            from .gui.main_window import MainWindow
+            app = QApplication.instance() or QApplication(sys.argv[:1])
+            w = MainWindow()
+            w.add_paths([src])
+            app.processEvents()
+            check("окно программы открывается", w.table.rowCount() >= 1)
+            w.close()
+    except Exception:
+        check("без исключений", False, traceback.format_exc())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    res["ok"] = ok
+    res["seconds"] = round(time.time() - t0, 1)
+    if out_json:
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False, indent=1)
+    print("SELFTEST", "PASSED" if ok else "FAILED", f"in {res['seconds']} s", flush=True)
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="VidAudCont", description="Таймкоды пауз/музыки и вырезание без потерь")
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--analyze", action="store_true", help="напечатать таймкоды для файлов и выйти")
+    ap.add_argument("--cut", metavar="TIMECODES", help='вырезать из файла, например "start-0:13, 6:35-end"')
+    ap.add_argument("--audio-only", action="store_true", help="при вырезании из видео сохранить только звук")
+    ap.add_argument("--json", metavar="FILE", help="записать результат в JSON")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--selftest-gui", action="store_true", help="самопроверка вместе с окном программы")
+    ap.add_argument("--version", action="version", version=__version__)
+    a = ap.parse_args(argv)
+
+    if a.selftest or a.selftest_gui:
+        return selftest(a.json, gui=a.selftest_gui)
+    if a.analyze:
+        from .engine.analyzer import Models, analyze
+        models, out = Models(), []
+        for f in a.files:
+            r = analyze(f, models)
+            print(f"{os.path.basename(f)}\t{r['timecodes']}", flush=True)
+            out.append(r)
+        if a.json:
+            with open(a.json, "w", encoding="utf-8") as fh:
+                json.dump(out, fh, ensure_ascii=False, indent=1)
+        return 0
+    if a.cut is not None:
+        if len(a.files) != 1:
+            ap.error("--cut: нужен ровно один файл")
+        info = cutter.probe(a.files[0])
+        rep = cutter.cut(a.files[0], parse(a.cut, info["duration"]), mode="audio" if a.audio_only else "auto")
+        print(json.dumps(rep, ensure_ascii=False, indent=1))
+        return 0 if rep["verification"]["lossless"] else 2
+    return run_gui(a.files)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
