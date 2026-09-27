@@ -26,15 +26,32 @@ def run_gui(files=()):
     from PySide6.QtWidgets import QApplication
 
     from .gui.main_window import MainWindow
+    from PySide6.QtCore import QStandardPaths, QUrl
+    from PySide6.QtGui import QDesktopServices
+    from PySide6.QtWidgets import QMessageBox
+
+    from . import applog
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setStyle("Fusion")
     app.setApplicationName("VidAudCont")
     app.setOrganizationName("VidAudCont")
+    log_file, crashed = applog.setup(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation), __version__)
     w = MainWindow()
     w.show()
+    if crashed:
+        box = QMessageBox(QMessageBox.Warning, "VidAudCont",
+                          "В прошлый раз программа закрылась неожиданно.\n\nПричина записана в журнал:\n"
+                          f"{log_file}\n\nПришлите этот файл разработчику — так ошибку можно будет исправить.", parent=w)
+        show = box.addButton("Показать файл", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is show:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(log_file)))
     if files:
         w.add_paths(list(files))
-    return app.exec()
+    code = app.exec()
+    applog.clean_exit()
+    return code
 
 
 def selftest(out_json=None, gui=False):

@@ -113,3 +113,27 @@ def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
         w.close()
     finally:
         sheet.close()
+
+
+@pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
+def test_watch_folder_picks_up_downloads(tmp_path, monkeypatch):
+    """A file finishing in the watched folder is added and analysed without any click."""
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    from vidaudcont.downloads import FolderWatcher
+    from vidaudcont.gui.main_window import MainWindow
+    w = MainWindow()
+    w.watch_dir, w.watching, w.auto_analyze = str(tmp_path), True, True
+    w.watcher = FolderWatcher(str(tmp_path))
+    shutil.copy(resources.asset("selftest.m4a"), tmp_path / "Скачанное видео.m4a")
+    w._scan_watch()
+    assert not w.items          # first look only records the size
+    w._scan_watch()
+    assert len(w.items) == 1
+    it = next(iter(w.items.values()))
+    wait(app, lambda: it["result"] is not None)
+    assert it["result"]["timecodes"].startswith("start-0:0")
+    w._scan_watch()
+    assert len(w.items) == 1    # not added twice
+    w.close()

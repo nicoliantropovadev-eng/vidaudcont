@@ -54,6 +54,7 @@ class Settings:
     merge_gap: float = 1.0      # cuts closer than this are merged
     accent: bool = True
     topic: bool = True
+    threads: int = 0            # processor threads for analysis (0 = half of the logical cores)
 
 
 ACCENT_GROUP = {"england": "британский", "scotland": "британский", "wales": "британский",
@@ -168,13 +169,19 @@ def load_whisper(models_dir, threads):
     return WhisperModel("whisper-base.en", device="cpu", compute_type="int8", cpu_threads=threads, files=files)
 
 
+def default_threads():
+    """Half of the logical cores: one per physical core on CPUs with SMT. Using every thread gains
+    little for this work, but keeps the processor at 100% (heat, noise, a sluggish computer)."""
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
 class Models:
     """Lazily loaded models, shared by all analyses in the process."""
 
     def __init__(self, models_dir=None, threads=0):
         import torch
         self.dir = models_dir or resources.models_dir()
-        self.threads = threads or max(1, (os.cpu_count() or 2) - 1)
+        self.threads = threads or default_threads()
         torch.set_num_threads(self.threads)
         self._lock = threading.Lock()
         self._vad = self._tagger = self._accent = self._asr = None
@@ -182,6 +189,15 @@ class Models:
         # the transcription runs in a separate process of this same program there.
         self.asr_in_subprocess = ((sys.platform == "darwin" and platform.machine() == "x86_64")
                                   or os.environ.get("VIDAUDCONT_ASR_SUBPROCESS") == "1")
+
+    def set_threads(self, n):
+        import torch
+        n = n or default_threads()
+        if n != self.threads:
+            with self._lock:
+                self.threads = n
+                torch.set_num_threads(n)
+                self._asr = None  # CTranslate2 takes its thread count at load time
 
     def vad(self):
         with self._lock:

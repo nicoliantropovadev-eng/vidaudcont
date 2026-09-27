@@ -8,15 +8,17 @@ import threading
 import traceback
 from dataclasses import asdict, fields
 
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
+                               QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
                                QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__, cutter
 from ..engine.analyzer import Models, Settings, analyze
+from ..applog import log_event
+from ..downloads import FolderWatcher, select_links, write_links
 from ..matching import TitleCache, match_files
 from ..sheet import SheetClient, SheetError, new_key, script_code
 from ..timecodes import fmt_time, format_cuts, parse
@@ -35,6 +37,7 @@ SETTING_LABELS = {
     "quiet_enabled": ("Вырезать слишком тихую речь", None, None, None),
     "quiet_abs": ("… тихая речь: громкость ниже, дБ", -60, -10, 1),
     "quiet_rel": ("… и тише остальной записи на, дБ", -30, 0, 1),
+    "threads": ("Потоков процессора для анализа (0 = половина)", 0, 64, 1),
     "accent": ("Определять акцент", None, None, None),
     "topic": ("Проверять тему (медицинская ли)", None, None, None),
 }
@@ -90,7 +93,8 @@ class Worker(QThread):
                 if kind == "analyze":
                     if self.models is None:
                         report(0.0, "загрузка моделей (первый раз дольше)")
-                        self.models = Models()
+                        self.models = Models(threads=payload["settings"].threads)
+                    self.models.set_threads(payload["settings"].threads)
                     res = analyze(payload["path"], self.models, payload["settings"], progress=report,
                                   cancelled=self.cancel_flag.is_set)
                 elif kind == "match":
@@ -199,7 +203,7 @@ class SettingsDialog(QDialog):
                 w = QDoubleSpinBox()
                 w.setRange(lo, hi)
                 w.setSingleStep(step)
-                w.setDecimals(2 if step < 0.5 else 1)
+                w.setDecimals(0 if isinstance(val, int) else (2 if step < 0.5 else 1))
                 w.setValue(val)
             self.widgets[f.name] = w
             form.addRow(label, w)
@@ -235,7 +239,10 @@ class SettingsDialog(QDialog):
     def values(self):
         st = Settings()
         for name, w in self.widgets.items():
-            setattr(st, name, w.isChecked() if isinstance(w, QCheckBox) else float(w.value()))
+            if isinstance(w, QCheckBox):
+                setattr(st, name, w.isChecked())
+            else:
+                setattr(st, name, int(w.value()) if isinstance(getattr(st, name), int) else float(w.value()))
         return st, {"out_dir": self.out_dir.text().strip(), "suffix": self.suffix.text() or "_cut"}
 
 
@@ -323,6 +330,105 @@ class SheetDialog(QDialog):
                     overwrite=self.overwrite.isChecked(), lang=self.lang.text().strip() or "ru")
 
 
+class DownloaderDialog(QDialog):
+    """Links for 4K Video Downloader+ and the folder the program watches for finished downloads."""
+
+    def __init__(self, rows, have_rows, watch_dir, watching, auto_analyze, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("4K Video Downloader+")
+        self.setMinimumWidth(660)
+        self.rows, self.have_rows = rows, set(have_rows)
+        form = QFormLayout(self)
+        first = min(r["row"] for r in rows) if rows else 1
+        last = max(r["row"] for r in rows) if rows else 1
+        rng = QHBoxLayout()
+        self.first, self.last = QSpinBox(), QSpinBox()
+        for w, v in ((self.first, first), (self.last, last)):
+            w.setRange(1, 100000)
+            w.setValue(v)
+            w.valueChanged.connect(self._update)
+        rng.addWidget(QLabel("с"))
+        rng.addWidget(self.first)
+        rng.addWidget(QLabel("по"))
+        rng.addWidget(self.last)
+        rng.addStretch(1)
+        form.addRow("Строки таблицы", rng)
+        self.skip_filled = QCheckBox("пропустить строки, где уже есть таймкоды (колонка D)")
+        self.skip_filled.setChecked(True)
+        self.skip_have = QCheckBox("пропустить видео, файлы которых уже есть в программе")
+        self.skip_have.setChecked(True)
+        for w in (self.skip_filled, self.skip_have):
+            w.toggled.connect(self._update)
+            form.addRow(w)
+        self.count = QLabel("")
+        form.addRow("Ссылок в файле", self.count)
+        folder = QHBoxLayout()
+        self.watch_dir = QLineEdit(watch_dir)
+        self.watch_dir.setPlaceholderText("папка, куда 4K Video Downloader+ сохраняет файлы")
+        browse = QPushButton("…")
+        browse.clicked.connect(self._browse)
+        folder.addWidget(self.watch_dir)
+        folder.addWidget(browse)
+        form.addRow("Папка загрузок", folder)
+        self.watching = QCheckBox("следить за этой папкой: новые файлы сами добавляются в программу")
+        self.watching.setChecked(watching)
+        form.addRow(self.watching)
+        self.auto_analyze = QCheckBox("и сразу анализировать их")
+        self.auto_analyze.setChecked(auto_analyze)
+        form.addRow(self.auto_analyze)
+        buttons = QHBoxLayout()
+        b_save = QPushButton("Сохранить файл со ссылками…")
+        b_save.clicked.connect(self._save)
+        b_copy = QPushButton("Скопировать ссылки")
+        b_copy.clicked.connect(self._copy)
+        buttons.addWidget(b_save)
+        buttons.addWidget(b_copy)
+        buttons.addStretch(1)
+        form.addRow(buttons)
+        self.help = QLabel(
+            "<b>В 4K Video Downloader+:</b> включите «Умный режим» (значок лампочки): <i>Аудио</i>, формат <i>M4A</i>, "
+            "папка — та же, что выше. Затем <i>Файл → Импорт загрузок</i>, выберите сохранённый файл со ссылками "
+            "и нажмите «Импорт». Готовые файлы программа подхватит сама.")
+        self.help.setWordWrap(True)
+        form.addRow(self.help)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self._update()
+
+    def links(self):
+        return select_links(self.rows, self.first.value(), self.last.value(), self.skip_filled.isChecked(),
+                            self.have_rows if self.skip_have.isChecked() else ())
+
+    def _update(self):
+        n = len(self.links())
+        self.count.setText(f"{n}" + ("  (ничего не выбрано — проверьте диапазон и галочки)" if not n else ""))
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка загрузок 4K Video Downloader+", self.watch_dir.text())
+        if d:
+            self.watch_dir.setText(d)
+
+    def _copy(self):
+        QGuiApplication.clipboard().setText("\n".join(link for _, link in self.links()))
+        self.count.setText(self.count.text().split("  ")[0] + "  — скопированы")
+
+    def _save(self):
+        links = self.links()
+        if not links:
+            return
+        start = os.path.join(self.watch_dir.text() or os.path.expanduser("~"),
+                             f"ссылки_строки_{links[0][0]}-{links[-1][0]}.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Файл со ссылками", start, "Текст (*.txt)")
+        if path:
+            write_links(path, links)
+            self.count.setText(f"{len(links)}  — сохранено в {os.path.basename(path)}")
+
+    def values(self):
+        return self.watch_dir.text().strip(), self.watching.isChecked(), self.auto_analyze.isChecked()
+
+
 ACCENT_NOTE = {"американский": "АМЕРИКАНСКИЙ АКЦЕНТ", "ирландский": "ИРЛАНДСКИЙ АКЦЕНТ",
                "австралийский": "АВСТРАЛИЙСКИЙ АКЦЕНТ", "индийский": "ИНДИЙСКИЙ АКЦЕНТ", "другой": "НЕ БРИТАНСКИЙ АКЦЕНТ"}
 
@@ -347,6 +453,16 @@ class MainWindow(QMainWindow):
         self.sheet_cfg = json.loads(self.qs.value("sheet", "{}") or "{}")
         self.sheet_rows = {}  # row -> {id, link, cuts, note} as last read from the table
         self._loading = False
+        self._match_queued = False
+        self.watch_dir = self.qs.value("watch_dir", "") or ""
+        self.watching = self.qs.value("watching", "false") == "true"
+        self.auto_analyze = self.qs.value("auto_analyze", "true") == "true"
+        self.watcher = FolderWatcher(self.watch_dir)
+        self.watch_timer = QTimer(self)
+        self.watch_timer.setInterval(4000)
+        self.watch_timer.timeout.connect(self._scan_watch)
+        if self.watching and self.watch_dir:
+            self.watch_timer.start()
 
         self.worker = Worker(self)
         self.worker.progress.connect(self.on_progress)
@@ -381,6 +497,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         act("Таблица…", self.open_sheet, "Подключение к Google Таблице")
         act("Найти строки", self.find_rows, "Определить, в какой строке таблицы ссылка на каждый файл")
+        act("4K Video Downloader+…", self.open_downloader, "Ссылки из таблицы для загрузки и папка, за которой "
+                                                           "следит программа")
         act("Экспорт в CSV…", self.export_csv, "Таблица с таймкодами всех файлов (открывается в Excel/Google Таблицах)")
         act("Настройки…", self.open_settings)
 
@@ -520,7 +638,8 @@ class MainWindow(QMainWindow):
         files = []
         for p in paths:
             if os.path.isdir(p):
-                for root, _, names in os.walk(p):
+                for root, dirs, names in os.walk(p):
+                    dirs[:] = [d for d in dirs if d != "готово" and not d.startswith(".")]  # our own results
                     files += [os.path.join(root, n) for n in sorted(names) if os.path.splitext(n)[1].lower() in MEDIA_EXT]
             elif os.path.isfile(p):
                 files.append(p)
@@ -837,6 +956,9 @@ class MainWindow(QMainWindow):
             if not quiet:
                 QMessageBox.information(self, "Таблица", "Сначала подключите таблицу: кнопка «Таблица…».")
             return
+        if self._match_queued:
+            return
+        self._match_queued = True
         paths = [it["path"] for it in self.items.values() if it.get("row_how") != "вручную"]
         self.worker.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
                                      "cache_path": os.path.join(app_data_dir(), "titles.json")})
@@ -846,6 +968,9 @@ class MainWindow(QMainWindow):
     def _apply_matches(self, res):
         self.sheet_rows = {r["row"]: r for r in res["rows"]}
         by_path = {it["path"]: fid for fid, it in self.items.items()}
+        for path in res["matches"]:
+            if path in by_path:
+                self.items[by_path[path]]["_match_tried"] = True
         found = 0
         for path, (row, how) in res["matches"].items():
             fid = by_path.get(path)
@@ -860,6 +985,51 @@ class MainWindow(QMainWindow):
         if missing:
             msg += f" Не найдены: {len(missing)} — укажите номер вручную (двойной щелчок в колонке «Строка»)."
         self.status_text.setText(msg)
+
+    def _pending_match_paths(self):
+        return [it["path"] for it in self.items.values() if it.get("row") is None and it.get("row_how") != "вручную"
+                and not it.get("_match_tried")]
+
+    def open_downloader(self):
+        rows = []
+        if self.sheet_cfg.get("url"):
+            if not self._refresh_sheet_rows():
+                return
+            rows = list(self.sheet_rows.values())
+        elif QMessageBox.question(self, "4K Video Downloader+", "Таблица не подключена — список ссылок не составить. "
+                                  "Настроить только папку загрузок?") != QMessageBox.Yes:
+            return
+        have = {it["row"] for it in self.items.values() if it.get("row")}
+        dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.auto_analyze, self)
+        if dlg.exec():
+            self.watch_dir, self.watching, self.auto_analyze = dlg.values()
+            self.qs.setValue("watch_dir", self.watch_dir)
+            self.qs.setValue("watching", "true" if self.watching else "false")
+            self.qs.setValue("auto_analyze", "true" if self.auto_analyze else "false")
+            if self.watcher.folder != self.watch_dir:
+                self.watcher = FolderWatcher(self.watch_dir)
+            if self.watching and self.watch_dir:
+                self.watch_timer.start()
+                self.status_text.setText(f"Слежу за папкой: {self.watch_dir}")
+                self._scan_watch()
+            else:
+                self.watch_timer.stop()
+
+    def _scan_watch(self):
+        known = {it["path"] for it in self.items.values()}
+        known |= {os.path.abspath(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
+        new = self.watcher.scan(known)
+        if not new:
+            return
+        before = set(self.items)
+        self.add_paths(new)
+        added = [fid for fid in self.items if fid not in before]
+        log_event(f"из папки загрузок добавлено: {len(added)}")
+        if self.auto_analyze:
+            for fid in added:
+                self._queue_analysis(fid)
+        self.status_text.setText(f"Из папки загрузок добавлено файлов: {len(added)}"
+                                 + (" — анализ запущен" if self.auto_analyze and added else ""))
 
     def _cuts_for(self, it):
         """(cuts, canonical timecode string) for a file, from the edited field or the analysis."""
@@ -1019,7 +1189,11 @@ class MainWindow(QMainWindow):
 
     def on_done(self, fid, kind, res):
         if kind == "match":
+            self._match_queued = False
             self._apply_matches(res)
+            if any(it.get("row") is None and it.get("row_how") != "вручную" for it in self.items.values()) \
+                    and self._pending_match_paths():
+                self.find_rows(quiet=True)  # files that arrived while the search was running
             self._maybe_idle(keep_text=True)
             return
         it = self.items.get(fid)
@@ -1033,9 +1207,12 @@ class MainWindow(QMainWindow):
             if kind == "analyze":
                 it["result"], it["text"], it["cut"] = res, None, None
                 it["status"] = "готово"
+                log_event(f"анализ: {os.path.basename(it['path'])} -> {res['timecodes']}")
             else:
                 it["cut"] = res
                 ok = (res.get("verification") or {}).get("lossless")
+                log_event(f"вырезано: {os.path.basename(it['path'])} -> {res['output']} "
+                          f"(без потерь: {ok}, таблица: {res.get('sheet', '-')})")
                 it["status"] = "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
                 if res.get("sheet") == "записано":
                     it["status"] += ", в таблице ✓"
@@ -1050,6 +1227,9 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind == "match":
+            self._match_queued = False
+        log_event(f"ошибка ({kind}): {msg}")
         it = self.items.get(fid)
         if it is None and msg != "остановлено":
             QMessageBox.warning(self, "Таблица" if kind in ("match", "sheet") else "Ошибка", msg.split("\n\n")[0])
