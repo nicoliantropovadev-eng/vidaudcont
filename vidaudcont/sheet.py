@@ -3,19 +3,28 @@
 The script runs inside the user's spreadsheet under their Google account, so the program needs no
 Google Cloud project or sign-in: it only knows the web app URL and a shared key.
 """
+import http.client
 import json
 import secrets
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import resources
+from . import __version__, resources
+from .applog import log_event
 
 PLACEHOLDER = "__VIDAUDCONT_KEY__"
+# Google's web apps now and then answer 404, 5xx or one of its own pages to a request that works a moment later
+TRANSIENT_HTTP = {404, 408, 429, 500, 502, 503, 504}
+RETRY_PAUSE = 2.0  # seconds before the first repeat, doubled for each next one: 2, 4, 8, 16
+USER_AGENT = f"VidAudCont/{__version__}"
 
 
 class SheetError(RuntimeError):
-    pass
+    def __init__(self, msg, transient=False):
+        super().__init__(msg)
+        self.transient = transient
 
 
 def new_key():
@@ -40,39 +49,67 @@ def col_number(letter_or_number):
 
 
 class SheetClient:
-    def __init__(self, url, key, sheet="", link_col="C", cuts_col="D", note_col="E", timeout=90):
+    def __init__(self, url, key, sheet="", link_col="C", cuts_col="D", note_col="E", timeout=90, retries=4,
+                 cancelled=None):
         if not url or not url.strip().startswith(("https://", "http://127.0.0.1")):  # 127.0.0.1: tests only
             raise SheetError("не указан адрес веб-приложения (https://script.google.com/…/exec)")
         self.url, self.key, self.sheet, self.timeout = url.strip(), key, sheet.strip(), timeout
+        self.retries, self.cancelled = retries, cancelled
         self.cols = {"link_col": col_number(link_col), "cuts_col": col_number(cuts_col),
                      "note_col": col_number(note_col)}
 
     @classmethod
-    def from_config(cls, cfg):
+    def from_config(cls, cfg, **kw):
         return cls(cfg.get("url", ""), cfg.get("key", ""), cfg.get("sheet", ""), cfg.get("link_col", "C"),
-                   cfg.get("cuts_col", "D"), cfg.get("note_col", "E"))
+                   cfg.get("cuts_col", "D"), cfg.get("note_col", "E"), **kw)
 
     def _call(self, payload, post=False):
+        """Passing failures are repeated with growing pauses: every action is safe to repeat (a write only sets
+        the same cells again, even if the first attempt reached the table and just its answer got lost)."""
+        for attempt in range(self.retries + 1):
+            try:
+                return self._call_once(payload, post)
+            except SheetError as e:
+                if not e.transient:
+                    raise
+                if attempt == self.retries:
+                    if attempt:
+                        raise SheetError(f"{e} Попыток: {attempt + 1}.", transient=True) from e
+                    raise
+                pause = RETRY_PAUSE * 2 ** attempt
+                log_event(f"таблица ({payload.get('action')}): {e} — повтор через {pause:g} с")
+                end = time.monotonic() + pause
+                while time.monotonic() < end:
+                    if self.cancelled and self.cancelled():
+                        raise InterruptedError("остановлено") from e
+                    time.sleep(min(0.25, max(0.0, end - time.monotonic())))
+
+    def _call_once(self, payload, post):
         payload = dict(payload, key=self.key, **self.cols)
         if self.sheet:
             payload["sheet"] = self.sheet
         if post:
             req = urllib.request.Request(self.url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
         else:
-            req = urllib.request.Request(self.url + ("&" if "?" in self.url else "?") + urllib.parse.urlencode(payload))
+            req = urllib.request.Request(self.url + ("&" if "?" in self.url else "?") + urllib.parse.urlencode(payload),
+                                         headers={"User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:  # Google answers via a redirect
                 raw = r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
+            if e.code in TRANSIENT_HTTP:
+                raise SheetError(f"Google не ответил (ошибка {e.code}). Обычно это временный сбой Google — "
+                                 "попробуйте ещё раз через минуту. Если ошибка не проходит, проверьте адрес "
+                                 "веб-приложения в «Таблица…».", transient=True) from e
             raise SheetError(f"Google ответил ошибкой {e.code}. Проверьте адрес веб-приложения.") from e
-        except urllib.error.URLError as e:
-            raise SheetError(f"нет связи с Google: {e.reason}") from e
+        except (OSError, http.client.HTTPException) as e:  # no network, timeout, dropped connection
+            raise SheetError(f"нет связи с Google: {getattr(e, 'reason', None) or e}", transient=True) from e
         try:
             data = json.loads(raw)
-        except ValueError:
+        except ValueError:  # Google's error page, or its sign-in page if the access is not "Anyone"
             raise SheetError("вместо ответа скрипта пришла страница Google. Проверьте, что при развёртывании "
-                             "выбран доступ «Все» и что адрес заканчивается на /exec.") from None
+                             "выбран доступ «Все» и что адрес заканчивается на /exec.", transient=True) from None
         if not data.get("ok"):
             err = data.get("error", "неизвестная ошибка")
             if err == "wrong key":

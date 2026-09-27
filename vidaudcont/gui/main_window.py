@@ -5,6 +5,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 import traceback
 from dataclasses import asdict, fields
 
@@ -100,8 +101,8 @@ class Worker(QThread):
                 elif kind == "match":
                     res = self._match(payload, report)
                 elif kind == "sheet":
-                    SheetClient.from_config(payload["cfg"]).write(payload["updates"])
-                    res = {"sheet": "записано", "updates": payload["updates"]}
+                    SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
+                    res = {"sheet": "записано", "updates": payload["updates"], "fids": payload.get("fids", [])}
                 else:
                     res = self._cut(payload, report)
                 self.done.emit(fid, kind, res)
@@ -115,7 +116,7 @@ class Worker(QThread):
 
     def _match(self, payload, report):
         report(0.02, "читаю таблицу")
-        rows = SheetClient.from_config(payload["cfg"]).rows()
+        rows = SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).rows()
         cache = TitleCache(payload["cache_path"])
         cache.fetch([r["id"] for r in rows], lang=payload["lang"], cancelled=self.cancel_flag.is_set,
                     progress=lambda f, t: report(0.05 + 0.9 * f, t))
@@ -132,12 +133,14 @@ class Worker(QThread):
             res = {"output": payload["out_path"], "mode": "copy", "keep": [], "notes": ["вырезать было нечего — файл скопирован"],
                    "source_duration": dur, "expected_duration": dur, "output_duration": dur,
                    "verification": {"lossless": True, "copy": True}}
+        res["timecodes"] = payload.get("tc")
         if payload.get("sheet"):
             report(0.99, "запись в таблицу")
             try:
-                SheetClient.from_config(payload["sheet"]["cfg"]).write([payload["sheet"]["update"]])
+                SheetClient.from_config(payload["sheet"]["cfg"], cancelled=self.cancel_flag.is_set).write(
+                    [payload["sheet"]["update"]])
                 res["sheet"], res["sheet_update"] = "записано", payload["sheet"]["update"]
-            except Exception as e:  # the file is cut; only the table update failed
+            except Exception as e:  # the file is cut; only the table update failed ("Вырезать все" repeats it)
                 res["sheet"] = f"ошибка: {e}"
         return res
 
@@ -315,7 +318,7 @@ class SheetDialog(QDialog):
     def _ping(self):
         QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            d = SheetClient.from_config(self.values()).ping()
+            d = SheetClient.from_config(self.values(), retries=1).ping()
             self.ping_result.setText(f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», "
                                      f"лист «{d['sheet']}», строк: {d['last_row']}</span>")
         except (SheetError, ValueError) as e:
@@ -437,6 +440,7 @@ ACCENT_NOTE = {"американский": "АМЕРИКАНСКИЙ АКЦЕН�
 COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезано"]
 COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 90]
 C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_CUT = range(8)
+MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
 
 
 class MainWindow(QMainWindow):
@@ -456,6 +460,11 @@ class MainWindow(QMainWindow):
         self.sheet_rows = {}  # row -> {id, link, cuts, note} as last read from the table
         self._loading = False
         self._match_queued = False
+        self._match_quiet = False
+        self._match_last = 0.0  # time.monotonic() of the last row search started
+        self.match_timer = QTimer(self)  # automatic row searches: not more often than MATCH_EVERY, retry on failure
+        self.match_timer.setSingleShot(True)
+        self.match_timer.timeout.connect(lambda: self.find_rows(quiet=True))
         self.watch_dir = self.qs.value("watch_dir", "") or ""
         self.watching = self.qs.value("watching", "false") == "true"
         self.auto_analyze = self.qs.value("auto_analyze", "true") == "true"
@@ -466,11 +475,13 @@ class MainWindow(QMainWindow):
         if self.watching and self.watch_dir:
             self.watch_timer.start()
 
-        self.worker = Worker(self)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.done.connect(self.on_done)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.start()
+        self.worker = Worker(self)  # analyses and cuts, one after another
+        self.net = Worker(self)     # row search and table writes: network only, runs next to the analysis
+        for w in (self.worker, self.net):
+            w.progress.connect(self.on_progress)
+            w.done.connect(self.on_done)
+            w.failed.connect(self.on_failed)
+            w.start()
 
         self._build_ui()
         self._restore_session()
@@ -960,10 +971,16 @@ class MainWindow(QMainWindow):
             return
         if self._match_queued:
             return
-        self._match_queued = True
+        wait = MATCH_EVERY - (time.monotonic() - self._match_last)
+        if quiet and wait > 0:  # files keep arriving from the downloader: one search for all of them
+            if not self.match_timer.isActive():
+                self.match_timer.start(int(wait * 1000))
+            return
+        self.match_timer.stop()
+        self._match_queued, self._match_quiet, self._match_last = True, quiet, time.monotonic()
         paths = [it["path"] for it in self.items.values() if it.get("row_how") != "вручную"]
-        self.worker.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
-                                     "cache_path": os.path.join(app_data_dir(), "titles.json")})
+        self.net.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
+                                  "cache_path": os.path.join(app_data_dir(), "titles.json")})
         self.progress.setVisible(True)
         self.status_text.setText("Ищу строки таблицы для файлов…")
 
@@ -1082,28 +1099,41 @@ class MainWindow(QMainWindow):
                 continue
             if not it.get("row"):
                 no_row.append(os.path.basename(it["path"]))
+                if self.sheet_cfg.get("url"):  # they wait for their row: cut as "name_cut" they would be lost
+                    continue
             todo.append((fid, cuts, tc))
-        if not todo:
-            QMessageBox.information(self, "Вырезать все", "Нет проанализированных файлов, которые ещё не вырезаны.")
+        unwritten = self._unwritten() if self.sheet_cfg.get("url") else []
+        if not todo and not unwritten:
+            text = "Нет проанализированных файлов, которые ещё не вырезаны."
+            if no_row:
+                text = (f"У всех проанализированных файлов ({len(no_row)}) пока нет номера строки таблицы. "
+                        "Нажмите «Найти строки» или впишите номер двойным щелчком в колонке «Строка».")
+            QMessageBox.information(self, "Вырезать все", text)
             return
         with_row = sum(1 for fid, _, _ in todo if self.items[fid].get("row"))
-        text = f"Будет обработано файлов: {len(todo)}.\n\n"
+        text = f"Будет обработано файлов: {len(todo)}.\n\n" if todo else ""
         if with_row:
             text += (f"{with_row} получат имя по номеру строки (например «{self.items[todo[0][0]].get('row') or 80}.m4a»)"
                      f" в папке «{self.extra.get('out_dir') or 'готово'}»")
             text += " и таймкоды будут записаны в таблицу.\n" if self.sheet_cfg.get("url") else ".\n"
         if no_row:
-            text += f"\nБез номера строки ({len(no_row)}) — сохранятся как «имя_cut», в таблицу не попадут:\n  " + \
-                    "\n  ".join(no_row[:8]) + ("\n  …" if len(no_row) > 8 else "") + "\n"
+            text += (f"\nБез номера строки ({len(no_row)}) — " +
+                     ("пока не вырезаются. Нажмите «Найти строки» или впишите номер вручную двойным щелчком в "
+                      "колонке «Строка»" if self.sheet_cfg.get("url") else "сохранятся как «имя_cut»") + ":\n  " +
+                     "\n  ".join(no_row[:8]) + ("\n  …" if len(no_row) > 8 else "") + "\n")
         if bad:
             text += "\nПропущены из-за ошибок в таймкодах:\n  " + "\n  ".join(bad[:5]) + "\n"
+        if unwritten:
+            text += (f"\nУже вырезаны, но их таймкоды не попали в таблицу: {len(unwritten)}. "
+                     "Программа допишет их, не вырезая файлы заново.\n")
         text += "\nИсходные файлы не изменяются. Продолжить?"
-        if QMessageBox.question(self, "Вырезать все", text) != QMessageBox.Yes:
+        if QMessageBox.question(self, "Вырезать все", text.lstrip()) != QMessageBox.Yes:
             return
         if not self._refresh_sheet_rows():
             return
         for fid, cuts, tc in todo:
             self._queue_cut(fid, cuts, tc)
+        self._queue_rewrite(unwritten)
 
     def _refresh_sheet_rows(self):
         """Read the table again right before writing, so filled cells are never overwritten by accident."""
@@ -1111,7 +1141,7 @@ class MainWindow(QMainWindow):
             return True
         QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.sheet_rows = {r["row"]: r for r in SheetClient.from_config(self.sheet_cfg).rows()}
+            self.sheet_rows = {r["row"]: r for r in SheetClient.from_config(self.sheet_cfg, retries=2).rows()}
             return True
         except (SheetError, ValueError) as e:
             QMessageBox.warning(self, "Таблица", f"Не удалось прочитать таблицу: {e}\n\nФайлы можно вырезать и без "
@@ -1138,9 +1168,35 @@ class MainWindow(QMainWindow):
         upd = self._sheet_update(it, tc)
         it["status"] = "в очереди на вырезание"
         self._refresh_row(fid)
-        self.worker.add(fid, "cut", {"path": it["path"], "cuts": cuts, "mode": mode, "out_path": out,
+        self.worker.add(fid, "cut", {"path": it["path"], "cuts": cuts, "tc": tc, "mode": mode, "out_path": out,
                                      "sheet": {"cfg": self.sheet_cfg, "update": upd} if upd else None})
         self.progress.setVisible(True)
+
+    def _queue_rewrite(self, fids):
+        """Files cut while the table did not answer: write their timecodes now, without cutting them again."""
+        updates, done = [], []
+        for fid in fids:
+            it = self.items[fid]
+            try:
+                tc = it["cut"].get("timecodes") or self._cuts_for(it)[1]
+            except ValueError:
+                continue
+            upd = self._sheet_update(it, tc)
+            if upd:
+                updates.append(upd)
+                done.append(fid)
+            else:  # the row was filled by hand meanwhile: nothing left to write
+                it["cut"]["sheet"] = "не нужно: в таблице уже заполнено"
+                it["status"] = it["status"].replace(", таблица: ошибка", "")
+                self._refresh_row(fid)
+        if updates:
+            self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": updates, "fids": done})
+            self.progress.setVisible(True)
+
+    def _unwritten(self):
+        """Files that are cut but whose timecodes did not reach the table."""
+        return [fid for fid, it in self.items.items() if it.get("row") and it.get("cut")
+                and str(it["cut"].get("sheet") or "").startswith("ошибка")]
 
     def write_current_to_sheet(self):
         it = self.items.get(self.current)
@@ -1165,12 +1221,16 @@ class MainWindow(QMainWindow):
         if old and old != tc and QMessageBox.question(
                 self, "Таблица", f"В строке {it['row']} уже записано:\n{old}\n\nЗаменить на:\n{tc}?") != QMessageBox.Yes:
             return
-        self.worker.add(self.current, "sheet", {"cfg": self.sheet_cfg, "updates": [{"row": it["row"], "cuts": tc}]})
+        self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": [{"row": it["row"], "cuts": tc}],
+                                  "fids": [self.current] if self.current in self._unwritten() else []})
         self.progress.setVisible(True)
 
     def stop_all(self):
-        for fid, kind, _ in self.worker.cancel_all():
-            if fid in self.items:
+        self.match_timer.stop()
+        for fid, kind, _ in self.worker.cancel_all() + self.net.cancel_all():
+            if kind == "match":
+                self._match_queued = False
+            elif fid in self.items and kind in ("analyze", "cut"):
                 self.items[fid]["status"] = "остановлено"
                 self._refresh_row(fid)
 
@@ -1178,6 +1238,8 @@ class MainWindow(QMainWindow):
     def on_progress(self, fid, frac, text):
         it = self.items.get(fid)
         if not it:
+            if self.worker.pending > 0:  # a row search next to a running analysis: the analysis keeps the status line
+                return
             self.progress.setVisible(True)
             self.progress.setValue(int(frac * 100))
             self.status_text.setText(text)
@@ -1200,9 +1262,18 @@ class MainWindow(QMainWindow):
             return
         it = self.items.get(fid)
         if kind == "sheet":
-            for u in res.get("updates", []):
+            ups = res.get("updates", [])
+            for u in ups:
                 self._remember_written(u)
-                self.status_text.setText(f"Строка {u['row']}: таймкоды записаны в таблицу.")
+            self.status_text.setText(f"Строка {ups[0]['row']}: таймкоды записаны в таблицу." if len(ups) == 1
+                                     else f"Дописано в таблицу строк: {len(ups)}.")
+            for f in res.get("fids", []):  # cut earlier, written only now
+                if f in self.items and self.items[f].get("cut"):
+                    self.items[f]["cut"]["sheet"] = "записано"
+                    self.items[f]["status"] = self.items[f]["status"].replace("таблица: ошибка", "в таблице ✓")
+                    self._refresh_row(f)
+            if res.get("fids"):
+                self._save_session()
             self._maybe_idle(keep_text=True)
             return
         if it is not None:
@@ -1221,7 +1292,8 @@ class MainWindow(QMainWindow):
                     self._remember_written(res["sheet_update"])
                 elif res.get("sheet"):
                     it["status"] += ", таблица: ошибка"
-                    self.status_text.setText(f"Строка {it.get('row')}: {res['sheet']}")
+                    self.status_text.setText(f"Строка {it.get('row')}: не записано в таблицу ({res['sheet']}). "
+                                             "Нажмите «Вырезать все» ещё раз — программа допишет.")
             self._refresh_row(fid)
             if fid == self.current:
                 self._show_details(fid)
@@ -1229,10 +1301,16 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        log_event(f"ошибка ({kind}): {msg}")
         if kind == "match":
             self._match_queued = False
-        log_event(f"ошибка ({kind}): {msg}")
-        it = self.items.get(fid)
+            if self._match_quiet and msg != "остановлено":  # started by itself for new files: no dialog, retry
+                self.status_text.setText("Таблица сейчас не отвечает — строки для новых файлов поищу снова через "
+                                         "минуту.")
+                self.match_timer.start(60000)
+                self._maybe_idle(keep_text=True)
+                return
+        it = self.items.get(fid) if kind != "sheet" else None  # a failed table write leaves the file's own state alone
         if it is None and msg != "остановлено":
             QMessageBox.warning(self, "Таблица" if kind in ("match", "sheet") else "Ошибка", msg.split("\n\n")[0])
         if it is not None:
@@ -1246,10 +1324,12 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def _maybe_idle(self, keep_text=False):
-        if self.worker.pending <= 0:
+        if self.worker.pending <= 0 and self.net.pending <= 0:
             self.progress.setVisible(False)
             if not keep_text:
-                self.status_text.setText("Готово")
+                n = len(self._unwritten())
+                self.status_text.setText("Готово" + (f". Не записаны в таблицу: {n} — нажмите «Вырезать все» ещё раз, "
+                                                     "программа допишет." if n else ""))
 
     # ------------------------------------------------------------------ settings, export, session
     def open_settings(self):
@@ -1312,5 +1392,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self._save_session()
+        self.match_timer.stop()
         self.worker.stop()
+        self.net.stop()
         super().closeEvent(ev)

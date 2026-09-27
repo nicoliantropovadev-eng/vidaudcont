@@ -63,8 +63,11 @@ def test_analyse_and_cut_in_window(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
 def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
-    """Files named like the downloader names them -> rows found -> 'Cut all' -> "<row>.m4a" + column D filled."""
+    """Files named like the downloader names them -> rows found -> 'Cut all' -> "<row>.m4a" + column D filled.
+    A write Google keeps refusing is completed by the next 'Cut all' without cutting again; a file without a row
+    is left alone instead of being saved as "name_cut"."""
     from vidaudcont import matching
+    from vidaudcont import sheet as sheet_mod
 
     from .mock_sheet import MockSheet
     app = QApplication.instance() or QApplication([])
@@ -76,6 +79,7 @@ def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
               "CCCCCCCCCC3": ("Clinical talk three", "Клинический разговор три")}
     monkeypatch.setattr(matching, "original_title", lambda vid: titles[vid][0])
     monkeypatch.setattr(matching, "localized_title", lambda vid, lang="ru": titles[vid][1])
+    monkeypatch.setattr(sheet_mod, "RETRY_PAUSE", 0.01)
     grid = [["", "", "Link", "", ""]] * 6 + [
         ["", "", "https://www.youtube.com/watch?v=AAAAAAAAAA1", "", ""],                     # row 7: empty D
         ["", "", "https://www.youtube.com/watch?v=BBBBBBBBBB2", "start-0:05", "моя пометка"],  # row 8: filled by hand
@@ -97,13 +101,27 @@ def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
         wait(app, lambda: all(it["result"] for it in w.items.values()), timeout=900)
         three = next(fid for fid, it in w.items.items() if it["row"] == 9)
         w.items[three]["text"] = "good"  # edited by hand: nothing to cut, only renamed
+        stray = str(src_dir / "Неизвестное видео.m4a")  # analysed, but its row is not known
+        shutil.copy(resources.asset("selftest.m4a"), stray)
+        lost = w._add_item(stray, {"status": "готово", "result": w.items[three]["result"]})
+        rowed = [fid for fid in w.items if fid != lost]
+        sheet.fail_posts = 5                 # the first write fails all 5 attempts, the others go through
         w.cut_all()
-        wait(app, lambda: all(it.get("cut") for it in w.items.values()), timeout=600)
+        wait(app, lambda: all(w.items[f].get("cut") for f in rowed) and w.worker.pending == 0, timeout=600)
         out = src_dir / "готово"
         assert sorted(os.listdir(out)) == ["7.m4a", "8.m4a", "9.m4a"]
-        for it in w.items.values():
+        assert w.items[lost]["cut"] is None and not os.path.exists(src_dir / "Неизвестное видео_cut.m4a")
+        failed = w._unwritten()
+        assert len(failed) == 1 and "таблица: ошибка" in w.items[failed[0]]["status"]
+        assert sheet.cell(w.items[failed[0]]["row"], 4) == ""
+        w.cut_all()                          # writes the missing row, cuts nothing again
+        wait(app, lambda: not w._unwritten() and w.net.pending == 0)
+        assert "в таблице ✓" in w.items[failed[0]]["status"]
+        assert sorted(os.listdir(out)) == ["7.m4a", "8.m4a", "9.m4a"]
+        for f in rowed:
+            it = w.items[f]
             assert it["cut"]["verification"]["lossless"], it["cut"]
-        tc7 = next(it for it in w.items.values() if it["row"] == 7)["result"]["timecodes"]
+        tc7 = next(it for it in w.items.values() if it.get("row") == 7)["result"]["timecodes"]
         assert sheet.cell(7, 4) == tc7                       # written
         assert sheet.cell(8, 4) == "start-0:05"              # hand-made value kept (overwrite is off)
         assert sheet.cell(8, 5) == "моя пометка"
@@ -137,3 +155,29 @@ def test_watch_folder_picks_up_downloads(tmp_path, monkeypatch):
     w._scan_watch()
     assert len(w.items) == 1    # not added twice
     w.close()
+
+
+def test_row_search_started_by_itself_retries_quietly(tmp_path, monkeypatch):
+    """Google not answering while files arrive: no error window, another try a minute later."""
+    from vidaudcont import sheet as sheet_mod
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    monkeypatch.setattr(sheet_mod, "RETRY_PAUSE", 0.01)
+    sheet = MockSheet([["", "", "Link"], ["", "", "https://www.youtube.com/watch?v=AAAAAAAAAA1"]], key="k")
+    try:
+        from vidaudcont.gui.main_window import MainWindow
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
+        sheet.fail_gets = 100
+        f = tmp_path / "Скачанное видео.m4a"
+        shutil.copy(resources.asset("selftest.m4a"), f)
+        w.add_paths([str(f)])
+        wait(app, lambda: not w._match_queued, timeout=60)
+        assert w.match_timer.isActive() and "не отвечает" in w.status_text.text()
+        assert sheet.requests == 5           # the first try and 4 repeats
+        w.close()
+    finally:
+        sheet.close()

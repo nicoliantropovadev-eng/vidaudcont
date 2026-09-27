@@ -13,6 +13,8 @@ class MockSheet:
         self.key = key
         self.pending = {}
         self.writes = []
+        self.requests = 0
+        self.fail_gets = self.fail_posts = 0  # answer that many next requests with Google's 404 page
         server = self
 
         class H(BaseHTTPRequestHandler):
@@ -27,16 +29,32 @@ class MockSheet:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _not_found(self):
+                body = "<html><body>Не удалось открыть файл.</body></html>".encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 u = urllib.parse.urlparse(self.path)
                 q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
                 if u.path == "/echo":
                     return self._send(server.pending.pop(q.get("id"), {"ok": False, "error": "expired"}))
+                server.requests += 1
+                if server.fail_gets > 0:
+                    server.fail_gets -= 1
+                    return self._not_found()
                 self._send(server.handle(q))
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
                 payload = json.loads(self.rfile.read(n) or b"{}")
+                server.requests += 1
+                if server.fail_posts > 0:
+                    server.fail_posts -= 1
+                    return self._not_found()
                 token = str(len(server.pending) + len(server.writes) + 1)
                 server.pending[token] = server.handle(payload)
                 self.send_response(302)  # Google answers POSTs with a redirect to the result

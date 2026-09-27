@@ -46,6 +46,27 @@ def test_client_roundtrip(sheet):
         bad.rows()
 
 
+def test_client_repeats_passing_google_errors(sheet, monkeypatch):
+    from vidaudcont import sheet as sheet_mod
+    monkeypatch.setattr(sheet_mod, "RETRY_PAUSE", 0.01)
+    c = SheetClient(sheet.url, "k")
+    sheet.fail_gets = 2                       # Google's "file not found" page twice, then the answer
+    assert [r["row"] for r in c.rows()] == [2, 3, 4, 5, 6]
+    sheet.fail_posts = 3
+    assert c.write([{"row": 3, "cuts": "0:01-0:09"}]) == 1 and sheet.cell(3, 4) == "0:01-0:09"
+    sheet.fail_gets = 10
+    with pytest.raises(SheetError, match="ошибка 404.*Попыток: 3") as e:
+        SheetClient(sheet.url, "k", retries=2).rows()
+    assert e.value.transient
+    sheet.fail_gets, before = 0, sheet.requests
+    with pytest.raises(SheetError, match="ключ"):
+        SheetClient(sheet.url, "wrong").rows()
+    assert sheet.requests == before + 1       # a wrong key is not a passing error: asked once
+    sheet.fail_gets = 10
+    with pytest.raises(InterruptedError):
+        SheetClient(sheet.url, "k", cancelled=lambda: True).rows()
+
+
 def test_client_rejects_non_https():
     with pytest.raises(SheetError):
         SheetClient("http://example.com/exec", "k")
