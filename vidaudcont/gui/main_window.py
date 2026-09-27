@@ -20,7 +20,7 @@ from .. import __version__, cutter
 from ..engine.analyzer import Settings, default_threads
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
-from ..downloads import FolderWatcher, select_links, write_links
+from ..downloads import FolderWatcher, norm_path, select_links, write_links
 from ..matching import TitleCache, match_files
 from ..sheet import SheetClient, SheetError, new_key, script_code
 from ..timecodes import fmt_time, format_cuts, parse
@@ -100,6 +100,9 @@ class Worker(QThread):
             try:
                 if kind == "match":
                     res = self._match(payload, report)
+                elif kind == "rows":
+                    res = {"rows": SheetClient.from_config(payload["cfg"], retries=2,
+                                                           cancelled=self.cancel_flag.is_set).rows()}
                 elif kind == "sheet":
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
                     res = {"sheet": "записано", "updates": payload["updates"], "fids": payload.get("fids", [])}
@@ -318,7 +321,7 @@ class SheetDialog(QDialog):
     def _ping(self):
         QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            d = SheetClient.from_config(self.values(), retries=1).ping()
+            d = SheetClient.from_config(self.values(), retries=1, timeout=30).ping()
             self.ping_result.setText(f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», "
                                      f"лист «{d['sheet']}», строк: {d['last_row']}</span>")
         except (SheetError, ValueError) as e:
@@ -444,6 +447,8 @@ MATCH_EVERY = 20  # seconds between row searches started by themselves (new file
 
 
 class MainWindow(QMainWindow):
+    watch_found = Signal(object)  # files the background look at the downloads folder found ready
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"VidAudCont {__version__} — вырезка пауз, музыки и лишнего")
@@ -469,6 +474,14 @@ class MainWindow(QMainWindow):
         self.watching = self.qs.value("watching", "false") == "true"
         self.auto_analyze = self.qs.value("auto_analyze", "true") == "true"
         self.watcher = FolderWatcher(self.watch_dir)
+        self._scanning = False
+        self.watch_found.connect(self._on_watch_found)
+        self._row_index = {}  # fid -> table row, checked on every use and rebuilt when stale
+        self._rows_then = None  # what to do once the table has been read in the background
+        self.save_timer = QTimer(self)  # many changes in a row end up in one write of the file list
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(3000)
+        self.save_timer.timeout.connect(self._write_session)
         self.watch_timer = QTimer(self)
         self.watch_timer.setInterval(4000)
         self.watch_timer.timeout.connect(self._scan_watch)
@@ -663,13 +676,14 @@ class MainWindow(QMainWindow):
                     files += [os.path.join(root, n) for n in sorted(names) if os.path.splitext(n)[1].lower() in MEDIA_EXT]
             elif os.path.isfile(p):
                 files.append(p)
-        known = {it["path"] for it in self.items.values()}
-        outputs = {os.path.abspath(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
+        known = {norm_path(it["path"]) for it in self.items.values()}
+        known |= {norm_path(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
         added = 0
         for f in files:
             f = os.path.abspath(f)
-            if f in known or f in outputs or os.path.basename(f).startswith(".") or "_cut" in os.path.basename(f):
+            if norm_path(f) in known or os.path.basename(f).startswith(".") or "_cut" in os.path.basename(f):
                 continue
+            known.add(norm_path(f))
             self._add_item(f)
             added += 1
         self._save_session()
@@ -704,10 +718,16 @@ class MainWindow(QMainWindow):
         return fid
 
     def _row_of(self, fid):
-        for r in range(self.table.rowCount()):
-            if self.table.item(r, C_FILE).data(Qt.UserRole) == fid:
-                return r
-        return -1
+        r = self._row_index.get(fid, -1)
+        item = self.table.item(r, C_FILE) if 0 <= r < self.table.rowCount() else None
+        if item is None or item.data(Qt.UserRole) != fid:  # rows were removed or not indexed yet
+            self._row_index = {}
+            for i in range(self.table.rowCount()):
+                cell = self.table.item(i, C_FILE)
+                if cell is not None:
+                    self._row_index[cell.data(Qt.UserRole)] = i
+            r = self._row_index.get(fid, -1)
+        return r
 
     def _refresh_row(self, fid):
         r, it = self._row_of(fid), self.items[fid]
@@ -973,9 +993,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Вырезать", "Вырезать нечего — в поле нет таймкодов (или «good»).")
             return
         mode = self.mode.currentData() if it.get("has_video") else None
-        if it.get("row") and not self._refresh_sheet_rows():
-            return
-        self._queue_cut(self.current, cuts, format_cuts(cuts, dur), mode)
+        fid, tc = self.current, format_cuts(cuts, dur)
+        if it.get("row"):
+            self._after_fresh_rows(lambda: self._queue_cut(fid, cuts, tc, mode))
+        else:
+            self._queue_cut(fid, cuts, tc, mode)
 
     # ------------------------------------------------------------------ Google Sheet
     def open_sheet(self):
@@ -1000,7 +1022,11 @@ class MainWindow(QMainWindow):
             return
         self.match_timer.stop()
         self._match_queued, self._match_quiet, self._match_last = True, quiet, time.monotonic()
-        paths = [it["path"] for it in self.items.values() if it.get("row_how") != "вручную"]
+        paths = [it["path"] for it in self.items.values()  # started by itself: only files still without a row
+                 if it.get("row_how") != "вручную" and not (quiet and it.get("row"))]
+        if not paths:
+            self._match_queued = False
+            return
         self.net.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
                                   "cache_path": os.path.join(app_data_dir(), "titles.json")})
         self.progress.setVisible(True)
@@ -1032,14 +1058,14 @@ class MainWindow(QMainWindow):
                 and not it.get("_match_tried")]
 
     def open_downloader(self):
-        rows = []
         if self.sheet_cfg.get("url"):
-            if not self._refresh_sheet_rows():
-                return
-            rows = list(self.sheet_rows.values())
+            self._after_fresh_rows(self._show_downloader)
         elif QMessageBox.question(self, "4K Video Downloader+", "Таблица не подключена — список ссылок не составить. "
-                                  "Настроить только папку загрузок?") != QMessageBox.Yes:
-            return
+                                  "Настроить только папку загрузок?") == QMessageBox.Yes:
+            self._show_downloader()
+
+    def _show_downloader(self):
+        rows = list(self.sheet_rows.values()) if self.sheet_cfg.get("url") else []
         have = {it["row"] for it in self.items.values() if it.get("row")}
         dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.auto_analyze, self)
         if dlg.exec():
@@ -1057,9 +1083,28 @@ class MainWindow(QMainWindow):
                 self.watch_timer.stop()
 
     def _scan_watch(self):
+        """Looks at the downloads folder in a background thread: opening each new file takes a moment."""
+        if self._scanning:
+            return
+        self._scanning = True
         known = {it["path"] for it in self.items.values()}
-        known |= {os.path.abspath(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
-        new = self.watcher.scan(known)
+        known |= {it["cut"]["output"] for it in self.items.values() if it.get("cut")}
+        watcher = self.watcher
+
+        def look():
+            try:
+                new = watcher.scan(known)
+            except Exception as e:  # a folder that went away, no access…: try again next time
+                log_event(f"папка загрузок: {e}")
+                new = []
+            try:
+                self.watch_found.emit(new)
+            except RuntimeError:  # the window is already closed
+                pass
+        threading.Thread(target=look, daemon=True, name="watch-folder").start()
+
+    def _on_watch_found(self, new):
+        self._scanning = False
         if not new:
             return
         before = set(self.items)
@@ -1151,26 +1196,27 @@ class MainWindow(QMainWindow):
         text += "\nИсходные файлы не изменяются. Продолжить?"
         if QMessageBox.question(self, "Вырезать все", text.lstrip()) != QMessageBox.Yes:
             return
-        if not self._refresh_sheet_rows():
-            return
-        for fid, cuts, tc in todo:
-            self._queue_cut(fid, cuts, tc)
-        self._queue_rewrite(unwritten)
 
-    def _refresh_sheet_rows(self):
-        """Read the table again right before writing, so filled cells are never overwritten by accident."""
+        def start():
+            for fid, cuts, tc in todo:
+                self._queue_cut(fid, cuts, tc)
+            self._queue_rewrite(unwritten)
+        self._after_fresh_rows(start)
+
+    def _after_fresh_rows(self, then):
+        """Read the table again right before writing, so filled cells are never overwritten by accident. It is
+        read in the background (Google can take a while to answer), and `then` goes on once it is in."""
         if not self.sheet_cfg.get("url"):
-            return True
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            self.sheet_rows = {r["row"]: r for r in SheetClient.from_config(self.sheet_cfg, retries=2).rows()}
-            return True
-        except (SheetError, ValueError) as e:
-            QMessageBox.warning(self, "Таблица", f"Не удалось прочитать таблицу: {e}\n\nФайлы можно вырезать и без "
-                                                 "таблицы — отключите её в «Таблица…» (очистите адрес).")
-            return False
-        finally:
-            QGuiApplication.restoreOverrideCursor()
+            then()
+            return
+        if self._rows_then is not None:  # a read is already on its way: both go on after it
+            first = self._rows_then
+            self._rows_then = lambda: (first(), then())
+            return
+        self._rows_then = then
+        self.net.add(0, "rows", {"cfg": self.sheet_cfg})
+        self.progress.setVisible(True)
+        self.status_text.setText("Читаю таблицу…")
 
     def _queue_cut(self, fid, cuts, tc, mode=None):
         it = self.items[fid]
@@ -1237,14 +1283,19 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "Таймкоды", str(e))
             return
-        if not self._refresh_sheet_rows():
+        fid = self.current
+        self._after_fresh_rows(lambda: self._write_to_sheet(fid, tc))
+
+    def _write_to_sheet(self, fid, tc):
+        it = self.items.get(fid)
+        if not it or not it.get("row"):
             return
         old = (self.sheet_rows.get(it["row"]) or {}).get("cuts", "").strip()
         if old and old != tc and QMessageBox.question(
                 self, "Таблица", f"В строке {it['row']} уже записано:\n{old}\n\nЗаменить на:\n{tc}?") != QMessageBox.Yes:
             return
         self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": [{"row": it["row"], "cuts": tc}],
-                                  "fids": [self.current] if self.current in self._unwritten() else []})
+                                  "fids": [fid] if fid in self._unwritten() else []})
         self.progress.setVisible(True)
 
     def stop_all(self):
@@ -1256,6 +1307,8 @@ class MainWindow(QMainWindow):
         for fid, kind, _ in self.worker.cancel_all() + self.net.cancel_all():
             if kind == "match":
                 self._match_queued = False
+            elif kind == "rows":
+                self._rows_then = None
             elif fid in self.items and kind in ("analyze", "cut"):
                 self.items[fid]["status"] = "остановлено"
                 self._refresh_row(fid)
@@ -1279,6 +1332,13 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "rows":
+            self.sheet_rows = {r["row"]: r for r in res["rows"]}
+            then, self._rows_then = self._rows_then, None
+            self._maybe_idle(keep_text=True)
+            if then:
+                then()
+            return
         if kind == "match":
             self._match_queued = False
             self._apply_matches(res)
@@ -1329,6 +1389,13 @@ class MainWindow(QMainWindow):
 
     def on_failed(self, fid, kind, msg):
         log_event(f"ошибка ({kind}): {msg}")
+        if kind == "rows":
+            self._rows_then = None
+            if msg != "остановлено":
+                QMessageBox.warning(self, "Таблица", f"Не удалось прочитать таблицу: {msg.split(chr(10) * 2)[0]}\n\n"
+                                    "Файлы можно вырезать и без таблицы — отключите её в «Таблица…» (очистите адрес).")
+            self._maybe_idle()
+            return
         if kind == "match":
             self._match_queued = False
             if self._match_quiet and msg != "остановлено":  # started by itself for new files: no dialog, retry
@@ -1392,17 +1459,27 @@ class MainWindow(QMainWindow):
         return os.path.join(app_data_dir(), "session.json")
 
     def _save_session(self):
+        """Written a few seconds later, once for many changes in a row (see _write_session)."""
+        if not self.save_timer.isActive():
+            self.save_timer.start()
+
+    def _write_session(self):
+        self.save_timer.stop()
         data = []
         for r in range(self.table.rowCount()):
             it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
-            st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else "ожидает анализа"
+            st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
+                ("ошибка" if it["status"] == "ошибка" else "ожидает анализа")
             if it["result"] and not st.startswith(("готово", "вырезано")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", "")})
-        try:
-            with open(self._session_file(), "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+        try:  # json.dumps uses the fast C encoder (json.dump would not); replace = never a half-written file
+            text = json.dumps(data, ensure_ascii=False)
+            tmp = self._session_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, self._session_file())
         except OSError:
             pass
 
@@ -1419,7 +1496,7 @@ class MainWindow(QMainWindow):
                 self._add_item(d["path"], d)
 
     def closeEvent(self, ev):
-        self._save_session()
+        self._write_session()
         self.match_timer.stop()
         self.pool.stop()
         self.worker.stop()

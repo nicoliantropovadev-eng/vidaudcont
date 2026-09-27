@@ -55,3 +55,16 @@ def test_known_files_are_skipped(tmp_path):
     w.scan(known={str(f)})
     assert w.scan(known={str(f)}) == []
     assert os.path.exists(f)
+
+
+def test_known_files_are_not_opened_again_whatever_the_spelling(tmp_path, monkeypatch):
+    from vidaudcont import downloads
+    opened = []
+    monkeypatch.setattr(downloads.cutter, "probe", lambda p: opened.append(p) or {"duration": 1.0})
+    for n in ("a.m4a", "b.m4a"):
+        (tmp_path / n).write_bytes(b"x" * 10)
+    w = FolderWatcher(str(tmp_path) + "/./")          # the folder as a dialog may spell it
+    known = {os.path.abspath(tmp_path / "a.m4a")}     # the file list spells it differently
+    w.scan(known)
+    assert w.scan(known) == [os.path.abspath(tmp_path / "b.m4a")]
+    assert opened == [os.path.abspath(tmp_path / "b.m4a")]

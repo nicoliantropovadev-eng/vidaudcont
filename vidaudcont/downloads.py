@@ -15,6 +15,12 @@ MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", "
              ".vob", ".asf", ".dv", ".mxf", ".f4v", ".rm", ".rmvb"}
 
 
+def norm_path(path):
+    """One spelling per file. Windows takes "D:/Загрузки\\a.m4a" and "d:\\загрузки\\A.m4a" for the same
+    file, and folder dialogs give forward slashes while the file list keeps backslashes."""
+    return os.path.normcase(os.path.abspath(path))
+
+
 def clean_link(video_id):
     """Plain video link: a "&list=…" part would make the downloader fetch the whole playlist."""
     return f"https://www.youtube.com/watch?v={video_id}"
@@ -42,29 +48,31 @@ def write_links(path, links):
 
 
 class FolderWatcher:
-    """Finds files that have finished downloading: size unchanged between two looks and readable."""
+    """Finds files that have finished downloading: size unchanged between two looks and readable.
+    scan() may be slow (it opens each new file) and is meant to run outside the window's thread."""
 
     def __init__(self, folder):
         self.folder = folder
-        self.seen = {}      # path -> (size, mtime) at the previous look
-        self.done = set()   # paths already handed over
+        self.seen = {}      # norm_path -> (size, mtime) at the previous look
+        self.done = set()   # norm_paths already handed over
 
     def scan(self, known=()):
         if not self.folder or not os.path.isdir(self.folder):
             return []
-        known = set(known)
+        known = {norm_path(p) for p in known}
         ready = []
         for name in sorted(os.listdir(self.folder)):
-            path = os.path.join(self.folder, name)
+            path = os.path.abspath(os.path.join(self.folder, name))
+            key = norm_path(path)
             if (name.startswith(".") or os.path.splitext(name)[1].lower() not in MEDIA_EXT
-                    or path in self.done or path in known or not os.path.isfile(path)):
+                    or key in self.done or key in known or not os.path.isfile(path)):
                 continue
             try:
                 st = os.stat(path)
             except OSError:
                 continue
             sig = (st.st_size, st.st_mtime)
-            prev, self.seen[path] = self.seen.get(path), sig
+            prev, self.seen[key] = self.seen.get(key), sig
             if prev != sig or st.st_size == 0:
                 continue  # new or still growing: look again next time
             try:
@@ -72,6 +80,6 @@ class FolderWatcher:
             except Exception:
                 complete = False
             if complete:
-                self.done.add(path)
+                self.done.add(key)
                 ready.append(path)
         return ready

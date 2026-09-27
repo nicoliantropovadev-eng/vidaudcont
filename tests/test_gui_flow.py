@@ -1,6 +1,7 @@
 """End-to-end through the window: add file -> analyse (worker thread) -> edit timecodes -> cut -> verified."""
 import os
 import shutil
+import threading
 import time
 
 import pytest
@@ -145,14 +146,18 @@ def test_watch_folder_picks_up_downloads(tmp_path, monkeypatch):
     w.watch_dir, w.watching, w.auto_analyze = str(tmp_path), True, True
     w.watcher = FolderWatcher(str(tmp_path))
     shutil.copy(resources.asset("selftest.m4a"), tmp_path / "Скачанное видео.m4a")
-    w._scan_watch()
+
+    def look():  # the folder is looked at in the background
+        w._scan_watch()
+        wait(app, lambda: not w._scanning, timeout=60)
+    look()
     assert not w.items          # first look only records the size
-    w._scan_watch()
+    look()
     assert len(w.items) == 1
     it = next(iter(w.items.values()))
     wait(app, lambda: it["result"] is not None)
     assert it["result"]["timecodes"].startswith("start-0:0")
-    w._scan_watch()
+    look()
     assert len(w.items) == 1    # not added twice
     w.close()
 
@@ -181,3 +186,49 @@ def test_row_search_started_by_itself_retries_quietly(tmp_path, monkeypatch):
         w.close()
     finally:
         sheet.close()
+
+
+def test_window_never_waits_for_the_folder_or_the_file_list(tmp_path, monkeypatch):
+    """Opening each new download takes a moment (on Windows ~0.1 s): with hundreds of files the window froze
+    for a minute. The folder is looked at in the background, and a file already in the list is not opened
+    again even when the folder is spelled differently (D:/Загрузки vs D:\\Загрузки)."""
+    from vidaudcont import downloads
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    opened = []
+
+    def slow_probe(path):
+        if threading.current_thread().name == "watch-folder":  # the window may look at a selected file itself
+            opened.append(path)
+            time.sleep(0.3)
+        return {"duration": 1.0, "audio": [], "video": []}
+    monkeypatch.setattr(downloads.cutter, "probe", slow_probe)
+    from vidaudcont.downloads import FolderWatcher
+    from vidaudcont.gui.main_window import MainWindow
+    for i in range(6):
+        (tmp_path / f"видео {i}.m4a").write_bytes(b"x" * 100)
+    w = MainWindow()
+    w.add_paths([str(tmp_path / "видео 0.m4a"), str(tmp_path / "видео 1.m4a")])  # already in the list
+    w.watcher = FolderWatcher(str(tmp_path) + "/./")
+    w._scan_watch()
+    wait(app, lambda: not w._scanning)
+    t = time.time()
+    w._scan_watch()                        # the second look opens the 4 new files: 1.2 s in the background
+    assert time.time() - t < 0.2
+    wait(app, lambda: not w._scanning)
+    assert len(w.items) == 6 and len(opened) == 4
+    assert all("видео 0" not in p and "видео 1" not in p for p in opened)
+
+    fid = next(iter(w.items))              # the file list: written once, a few seconds after the changes
+    w.items[fid]["status"] = "ошибка"
+    session = w._session_file()
+    if os.path.exists(session):
+        os.remove(session)
+    for _ in range(50):
+        w._save_session()
+    assert not os.path.exists(session) and w.save_timer.isActive()
+    w._write_session()
+    import json
+    saved = json.load(open(session, encoding="utf-8"))
+    assert len(saved) == 6 and saved[0]["status"] == "ошибка"  # a failed file is not analysed again on start
+    w.close()
