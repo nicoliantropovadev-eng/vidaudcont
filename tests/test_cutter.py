@@ -33,9 +33,20 @@ CASES = {
                                                       "-c:a", "aac", "-shortest"], "audio", 0.1),
     "mkv_h264_opus": (".mkv", VIDEO + AUDIO + ["-c:v", "libx264", "-g", "50", "-pix_fmt", "yuv420p",
                                                 "-c:a", "libopus", "-shortest"], "video", 4.1),
+    "ogv_theora_vorbis": (".ogv", VIDEO + AUDIO + ["-c:v", "libtheora", "-g", "25", "-c:a", "libvorbis", "-shortest"],
+                          "video", 2.1),
     "mov_h264_aac": (".mov", VIDEO + AUDIO + ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p",
                                                "-c:a", "aac", "-shortest"], "video", 2.1),
 }
+
+
+_ENCODERS = subprocess.run([FF, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+
+
+def need_encoders(args):
+    for i, a in enumerate(args[:-1]):
+        if a in ("-c:a", "-c:v") and args[i + 1] not in ("copy",) and f" {args[i + 1]} " not in _ENCODERS:
+            pytest.skip(f"this ffmpeg build has no {args[i + 1]} encoder")
 
 
 def make(path, args):
@@ -52,6 +63,7 @@ def test_cut_is_lossless(tmp_path, name):
     ext, args, mode, tol = CASES[name]
     # awkward file name on purpose: spaces, apostrophe, Cyrillic
     src = str(tmp_path / f"тест 'файл' {name}{ext}")
+    need_encoders(args)
     make(src, args)
     rep = cutter.cut(src, CUTS, mode=mode)
     out = rep["output"]

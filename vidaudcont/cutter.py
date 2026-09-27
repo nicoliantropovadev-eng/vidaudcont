@@ -30,6 +30,9 @@ AUDIO_CONTAINER = {
     "pcm_s32le": ".wav", "pcm_f32le": ".wav", "pcm_u8": ".wav", "pcm_s16be": ".aiff", "pcm_s24be": ".aiff",
 }
 MP4_LIKE = {".mp4", ".m4a", ".m4v", ".mov", ".3gp", ".m4b"}
+# ffmpeg >= 9 starts a new chained Ogg stream when the concat demuxer switches files (it attaches
+# "new extradata" to the first packet of each part); joining through NUT first avoids that
+OGG_LIKE = {".ogg", ".oga", ".ogv", ".opus", ".spx"}
 LOSSLESS = {"flac", "alac", "wavpack", "tta", "ape", "mlp", "truehd", "shorten", "als"}
 LOSSLESS_ENCODER = {"flac": ("flac", ".flac"), "alac": ("alac", ".m4a"), "wavpack": ("wavpack", ".wv"),
                     "tta": ("tta", ".tta")}  # anything else lossless -> FLAC
@@ -235,10 +238,17 @@ def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, v
             with open(lst, "w", encoding="utf-8") as f:
                 f.write("ffconcat version 1.0\n" + "".join(
                     "file '" + x.replace("'", "'\\''") + "'\n" for x in parts))
-            _ffmpeg(["-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", lst, "-i", path,
-                     "-map_metadata", "1", "-map_chapters", "-1"] + maps +
-                    ["-sn", "-dn", "-c", "copy"] + faststart + [tmp_out], progress, 0.9, 0.97, total, cancelled,
-                    "склейка")
+            if out_ext in OGG_LIKE:
+                joined = os.path.join(tmpdir, "joined.nut")
+                _ffmpeg(["-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", lst] + maps +
+                        ["-sn", "-dn", "-c", "copy", joined], progress, 0.9, 0.94, total, cancelled, "склейка")
+                _ffmpeg(["-i", joined, "-i", path, "-map_metadata", "1", "-map_chapters", "-1", "-map", "0",
+                         "-c", "copy", tmp_out], progress, 0.94, 0.97, total, cancelled, "склейка")
+            else:
+                _ffmpeg(["-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", lst, "-i", path,
+                         "-map_metadata", "1", "-map_chapters", "-1"] + maps +
+                        ["-sn", "-dn", "-c", "copy"] + faststart + [tmp_out], progress, 0.9, 0.97, total, cancelled,
+                        "склейка")
         os.replace(tmp_out, out_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
