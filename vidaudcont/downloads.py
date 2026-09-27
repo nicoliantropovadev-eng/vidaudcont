@@ -1,8 +1,9 @@
-"""Hand-over to 4K Video Downloader+: a list of links to import, and a folder to watch for the files.
+"""Hand-over to 4K Video Downloader+: a list of links to paste, and a folder to watch for the files.
 
-4K Video Downloader+ has no command line, but imports links from a TXT file (File → Import
-downloads) and, in Smart Mode, saves them as M4A into a chosen folder. The program writes that
-TXT from the sheet and picks up every file that finishes downloading in the folder.
+4K Video Downloader+ has no command line. Its File → Import only reads its own export files, but
+"Paste Link" takes many links from the clipboard at once and, in Smart Mode, saves them as M4A
+into a chosen folder. The program copies the links from the sheet and picks up every file that
+finishes downloading in the folder.
 """
 import os
 

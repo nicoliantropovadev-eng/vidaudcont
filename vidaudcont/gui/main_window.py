@@ -361,7 +361,7 @@ class DownloaderDialog(QDialog):
             w.toggled.connect(self._update)
             form.addRow(w)
         self.count = QLabel("")
-        form.addRow("Ссылок в файле", self.count)
+        form.addRow("Ссылок", self.count)
         folder = QHBoxLayout()
         self.watch_dir = QLineEdit(watch_dir)
         self.watch_dir.setPlaceholderText("папка, куда 4K Video Downloader+ сохраняет файлы")
@@ -377,18 +377,20 @@ class DownloaderDialog(QDialog):
         self.auto_analyze.setChecked(auto_analyze)
         form.addRow(self.auto_analyze)
         buttons = QHBoxLayout()
-        b_save = QPushButton("Сохранить файл со ссылками…")
-        b_save.clicked.connect(self._save)
         b_copy = QPushButton("Скопировать ссылки")
         b_copy.clicked.connect(self._copy)
-        buttons.addWidget(b_save)
+        b_save = QPushButton("Сохранить список в файл…")
+        b_save.clicked.connect(self._save)
         buttons.addWidget(b_copy)
+        buttons.addWidget(b_save)
         buttons.addStretch(1)
         form.addRow(buttons)
+        # its File → Import only takes its own export files (*.json *.csv *.4kv), but Paste Link takes many links at once
         self.help = QLabel(
             "<b>В 4K Video Downloader+:</b> включите «Умный режим» (значок лампочки): <i>Аудио</i>, формат <i>M4A</i>, "
-            "папка — та же, что выше. Затем <i>Файл → Импорт загрузок</i>, выберите сохранённый файл со ссылками "
-            "и нажмите «Импорт». Готовые файлы программа подхватит сама.")
+            "папка — та же, что выше. Нажмите здесь «Скопировать ссылки», а там — «Вставить ссылку»: добавятся "
+            "все ссылки сразу. Если добавились не все, копируйте частями, например по 50 строк. "
+            "Готовые файлы программа подхватит сама.")
         self.help.setWordWrap(True)
         form.addRow(self.help)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
