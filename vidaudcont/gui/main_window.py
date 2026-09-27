@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import queue
+import shutil
 import threading
 import traceback
 from dataclasses import asdict, fields
@@ -16,7 +17,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from .. import __version__, cutter
 from ..engine.analyzer import Models, Settings, analyze
-from ..timecodes import fmt_time, parse
+from ..matching import TitleCache, match_files
+from ..sheet import SheetClient, SheetError, new_key, script_code
+from ..timecodes import fmt_time, format_cuts, parse
 
 MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac",
              ".ape", ".wv", ".amr", ".ac3", ".eac3", ".mka", ".caf", ".m4b", ".mp2", ".mp4", ".m4v", ".mov", ".mkv",
@@ -90,9 +93,13 @@ class Worker(QThread):
                         self.models = Models()
                     res = analyze(payload["path"], self.models, payload["settings"], progress=report,
                                   cancelled=self.cancel_flag.is_set)
+                elif kind == "match":
+                    res = self._match(payload, report)
+                elif kind == "sheet":
+                    SheetClient.from_config(payload["cfg"]).write(payload["updates"])
+                    res = {"sheet": "записано", "updates": payload["updates"]}
                 else:
-                    res = cutter.cut(payload["path"], payload["cuts"], out_path=payload.get("out_path"),
-                                     mode=payload["mode"], progress=report, cancelled=self.cancel_flag.is_set)
+                    res = self._cut(payload, report)
                 self.done.emit(fid, kind, res)
             except InterruptedError:
                 self.failed.emit(fid, kind, "остановлено")
@@ -100,6 +107,35 @@ class Worker(QThread):
                 self.failed.emit(fid, kind, f"{e}\n\n{traceback.format_exc(limit=3)}")
             finally:
                 self.pending -= 1
+
+
+    def _match(self, payload, report):
+        report(0.02, "читаю таблицу")
+        rows = SheetClient.from_config(payload["cfg"]).rows()
+        cache = TitleCache(payload["cache_path"])
+        cache.fetch([r["id"] for r in rows], lang=payload["lang"], cancelled=self.cancel_flag.is_set,
+                    progress=lambda f, t: report(0.05 + 0.9 * f, t))
+        return {"rows": rows, "matches": match_files(payload["paths"], rows, cache.data, lang=payload["lang"])}
+
+    def _cut(self, payload, report):
+        if payload["cuts"]:
+            res = cutter.cut(payload["path"], payload["cuts"], out_path=payload.get("out_path"), mode=payload["mode"],
+                             progress=report, cancelled=self.cancel_flag.is_set)
+        else:  # nothing to cut: the file is only copied under its new name (bit-for-bit)
+            os.makedirs(os.path.dirname(payload["out_path"]), exist_ok=True)
+            shutil.copy2(payload["path"], payload["out_path"])
+            dur = cutter.probe(payload["out_path"])["duration"]
+            res = {"output": payload["out_path"], "mode": "copy", "keep": [], "notes": ["вырезать было нечего — файл скопирован"],
+                   "source_duration": dur, "expected_duration": dur, "output_duration": dur,
+                   "verification": {"lossless": True, "copy": True}}
+        if payload.get("sheet"):
+            report(0.99, "запись в таблицу")
+            try:
+                SheetClient.from_config(payload["sheet"]["cfg"]).write([payload["sheet"]["update"]])
+                res["sheet"], res["sheet_update"] = "записано", payload["sheet"]["update"]
+            except Exception as e:  # the file is cut; only the table update failed
+                res["sheet"] = f"ошибка: {e}"
+        return res
 
 
 class Timeline(QWidget):
@@ -203,8 +239,96 @@ class SettingsDialog(QDialog):
         return st, {"out_dir": self.out_dir.text().strip(), "suffix": self.suffix.text() or "_cut"}
 
 
-COLS = ["Файл", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезано"]
-COL_WIDTH = [230, 58, 110, 270, 90, 95, 90]
+class SheetDialog(QDialog):
+    """Connection to the Google Sheet (Apps Script web app) and what to write there."""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Google Таблица")
+        self.setMinimumWidth(640)
+        self.cfg = dict(cfg)
+        if not self.cfg.get("key"):
+            self.cfg["key"] = new_key()
+        form = QFormLayout(self)
+        steps = QLabel(
+            "<b>Подключение (один раз):</b><br>"
+            "1. Нажмите «Скопировать код для Google».<br>"
+            "2. В таблице: Расширения → Apps Script. Удалите всё в редакторе, вставьте код, нажмите «Сохранить».<br>"
+            "3. «Начать развёртывание» → «Новое развёртывание» → шестерёнка → «Веб-приложение»; "
+            "запуск от имени: «Я», доступ: «Все» → «Начать развёртывание», разрешите доступ.<br>"
+            "4. Скопируйте «URL веб-приложения» в поле ниже и нажмите «Проверить связь».")
+        steps.setWordWrap(True)
+        form.addRow(steps)
+        b_code = QPushButton("Скопировать код для Google")
+        b_code.clicked.connect(self._copy_code)
+        form.addRow(b_code)
+        self.url = QLineEdit(self.cfg.get("url", ""))
+        self.url.setPlaceholderText("https://script.google.com/macros/s/…/exec")
+        form.addRow("URL веб-приложения", self.url)
+        self.sheet = QLineEdit(self.cfg.get("sheet", ""))
+        self.sheet.setPlaceholderText("первый лист")
+        form.addRow("Лист", self.sheet)
+        cols = QHBoxLayout()
+        self.link_col = QLineEdit(self.cfg.get("link_col", "C"))
+        self.cuts_col = QLineEdit(self.cfg.get("cuts_col", "D"))
+        self.note_col = QLineEdit(self.cfg.get("note_col", "E"))
+        for label, w in (("ссылки", self.link_col), ("таймкоды", self.cuts_col), ("пометки", self.note_col)):
+            w.setMaximumWidth(40)
+            cols.addWidget(QLabel(label))
+            cols.addWidget(w)
+        cols.addStretch(1)
+        form.addRow("Колонки", cols)
+        self.write_note = QCheckBox("Писать в колонку пометок «АМЕРИКАНСКИЙ АКЦЕНТ» и т.п., если там пусто")
+        self.write_note.setChecked(self.cfg.get("write_note", True))
+        form.addRow(self.write_note)
+        self.overwrite = QCheckBox("Перезаписывать таймкоды, которые уже есть в таблице")
+        self.overwrite.setChecked(self.cfg.get("overwrite", False))
+        form.addRow(self.overwrite)
+        self.lang = QLineEdit(self.cfg.get("lang", "ru"))
+        self.lang.setMaximumWidth(40)
+        self.lang.setToolTip("На каком языке YouTube показывал названия, когда вы скачивали файлы (ru, en, …)")
+        form.addRow("Язык названий в именах файлов", self.lang)
+        row = QHBoxLayout()
+        b_ping = QPushButton("Проверить связь")
+        b_ping.clicked.connect(self._ping)
+        row.addWidget(b_ping)
+        self.ping_result = QLabel("")
+        self.ping_result.setWordWrap(True)
+        row.addWidget(self.ping_result, 1)
+        form.addRow(row)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _copy_code(self):
+        QGuiApplication.clipboard().setText(script_code(self.cfg["key"]))
+        self.ping_result.setText("Код скопирован — вставьте его в Apps Script.")
+
+    def _ping(self):
+        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            d = SheetClient.from_config(self.values()).ping()
+            self.ping_result.setText(f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», "
+                                     f"лист «{d['sheet']}», строк: {d['last_row']}</span>")
+        except (SheetError, ValueError) as e:
+            self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+    def values(self):
+        return dict(self.cfg, url=self.url.text().strip(), sheet=self.sheet.text().strip(),
+                    link_col=self.link_col.text().strip() or "C", cuts_col=self.cuts_col.text().strip() or "D",
+                    note_col=self.note_col.text().strip() or "E", write_note=self.write_note.isChecked(),
+                    overwrite=self.overwrite.isChecked(), lang=self.lang.text().strip() or "ru")
+
+
+ACCENT_NOTE = {"американский": "АМЕРИКАНСКИЙ АКЦЕНТ", "ирландский": "ИРЛАНДСКИЙ АКЦЕНТ",
+               "австралийский": "АВСТРАЛИЙСКИЙ АКЦЕНТ", "индийский": "ИНДИЙСКИЙ АКЦЕНТ", "другой": "НЕ БРИТАНСКИЙ АКЦЕНТ"}
+
+COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезано"]
+COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 90]
+C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_CUT = range(8)
 
 
 class MainWindow(QMainWindow):
@@ -220,6 +344,9 @@ class MainWindow(QMainWindow):
         self.settings = Settings(**{k: v for k, v in json.loads(self.qs.value("settings", "{}")).items()
                                     if k in Settings.__dataclass_fields__})
         self.extra = json.loads(self.qs.value("extra", "{}")) or {"out_dir": "", "suffix": "_cut"}
+        self.sheet_cfg = json.loads(self.qs.value("sheet", "{}") or "{}")
+        self.sheet_rows = {}  # row -> {id, link, cuts, note} as last read from the table
+        self._loading = False
 
         self.worker = Worker(self)
         self.worker.progress.connect(self.on_progress)
@@ -248,8 +375,12 @@ class MainWindow(QMainWindow):
         act("Убрать из списка", self.remove_selected)
         tb.addSeparator()
         act("Анализировать все", self.analyze_all, "Найти таймкоды для всех файлов без результата")
+        act("Вырезать все ✂", self.cut_all, "Вырезать все проанализированные файлы, назвать их номером строки "
+                                             "и записать таймкоды в таблицу")
         act("Остановить", self.stop_all)
         tb.addSeparator()
+        act("Таблица…", self.open_sheet, "Подключение к Google Таблице")
+        act("Найти строки", self.find_rows, "Определить, в какой строке таблицы ссылка на каждый файл")
         act("Экспорт в CSV…", self.export_csv, "Таблица с таймкодами всех файлов (открывается в Excel/Google Таблицах)")
         act("Настройки…", self.open_settings)
 
@@ -257,8 +388,9 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.verticalHeader().setVisible(False)
+        self.table.itemChanged.connect(self.on_item_changed)
         hh = self.table.horizontalHeader()
         for c, wdt in enumerate(COL_WIDTH):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
@@ -300,6 +432,10 @@ class MainWindow(QMainWindow):
         b_reset = QPushButton("Вернуть найденные")
         b_reset.clicked.connect(self.reset_timecodes)
         row.addWidget(b_reset)
+        self.b_to_sheet = QPushButton("В таблицу")
+        self.b_to_sheet.setToolTip("Записать эти таймкоды в Google Таблицу, в строку этого файла")
+        self.b_to_sheet.clicked.connect(self.write_current_to_sheet)
+        row.addWidget(self.b_to_sheet)
         bl.addLayout(row)
         rl.addWidget(box)
 
@@ -389,28 +525,40 @@ class MainWindow(QMainWindow):
             elif os.path.isfile(p):
                 files.append(p)
         known = {it["path"] for it in self.items.values()}
+        outputs = {os.path.abspath(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
+        added = 0
         for f in files:
             f = os.path.abspath(f)
-            if f in known or os.path.basename(f).startswith(".") or "_cut" in os.path.basename(f):
+            if f in known or f in outputs or os.path.basename(f).startswith(".") or "_cut" in os.path.basename(f):
                 continue
             self._add_item(f)
+            added += 1
         self._save_session()
+        if added and self.sheet_cfg.get("url"):
+            self.find_rows(quiet=True)
 
     def _add_item(self, path, state=None):
         fid = self.next_id
         self.next_id += 1
-        it = {"path": path, "status": "ожидает анализа", "result": None, "text": None, "cut": None}
+        it = {"path": path, "status": "ожидает анализа", "result": None, "text": None, "cut": None,
+              "row": None, "row_how": ""}
         if state:
-            it.update({k: state.get(k) for k in ("status", "result", "text", "cut")})
+            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how") if k in state})
         self.items[fid] = it
+        self._loading = True
         r = self.table.rowCount()
         self.table.insertRow(r)
         name = QTableWidgetItem(os.path.basename(path))
         name.setData(Qt.UserRole, fid)
         name.setToolTip(path)
-        self.table.setItem(r, 0, name)
+        name.setFlags(name.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(r, C_FILE, name)
         for c in range(1, len(COLS)):
-            self.table.setItem(r, c, QTableWidgetItem(""))
+            cell = QTableWidgetItem("")
+            if c != C_ROW:
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(r, c, cell)
+        self._loading = False
         self._refresh_row(fid)
         if self.table.rowCount() == 1:
             self.table.selectRow(0)
@@ -418,7 +566,7 @@ class MainWindow(QMainWindow):
 
     def _row_of(self, fid):
         for r in range(self.table.rowCount()):
-            if self.table.item(r, 0).data(Qt.UserRole) == fid:
+            if self.table.item(r, C_FILE).data(Qt.UserRole) == fid:
                 return r
         return -1
 
@@ -426,32 +574,58 @@ class MainWindow(QMainWindow):
         r, it = self._row_of(fid), self.items[fid]
         if r < 0:
             return
+        self._loading = True
         res = it["result"] or {}
-        self.table.item(r, 1).setText(fmt_time(res["duration"]) if res else "")
-        self.table.item(r, 2).setText(it["status"])
+        row_item = self.table.item(r, C_ROW)
+        row_item.setText(str(it["row"]) if it.get("row") else "")
+        info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
+        row_item.setToolTip((f"Найдено: {it.get('row_how')}\n" if it.get("row_how") else "") +
+                            (info["link"] if info else "Двойной щелчок — указать номер строки вручную"))
+        self.table.item(r, C_DUR).setText(fmt_time(res["duration"]) if res else "")
+        self.table.item(r, C_STATUS).setText(it["status"])
         tc = it["text"] if it["text"] is not None else res.get("timecodes", "")
-        self.table.item(r, 3).setText(tc)
-        self.table.item(r, 3).setToolTip(tc)
+        self.table.item(r, C_TC).setText(tc)
+        self.table.item(r, C_TC).setToolTip(tc)
         acc = (res.get("accent") or {}).get("groups") or {}
         top = next(iter(acc.items()), None)
-        acc_item = self.table.item(r, 4)
+        acc_item = self.table.item(r, C_ACC)
         short = {"британский": "брит.", "американский": "амер.", "ирландский": "ирл.", "австралийский": "австрал.",
                  "индийский": "инд.", "другой": "другой"}
         acc_item.setText(f"{short.get(top[0], top[0])} {top[1]:.0%}" if top else "")
         acc_item.setToolTip(", ".join(f"{k} {v:.0%}" for k, v in acc.items()))
         acc_item.setForeground(QColor("#2e7d32") if top and top[0] == "британский" else QColor("#c62828"))
         topic = res.get("topic")
-        t_item = self.table.item(r, 5)
+        t_item = self.table.item(r, C_TOPIC)
         t_item.setText("" if not topic else ("медицинская" if topic.get("medical") else "проверьте"))
         t_item.setForeground(QColor("#2e7d32") if topic and topic.get("medical") else QColor("#ef6c00"))
         cut = it.get("cut")
-        self.table.item(r, 6).setText(("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
-                                      os.path.basename(cut["output"]) if cut else "")
+        cut_item = self.table.item(r, C_CUT)
+        cut_item.setText(("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
+                         os.path.basename(cut["output"]) if cut else "")
+        cut_item.setToolTip(f"в таблице: {cut['sheet']}" if cut and cut.get("sheet") else "")
+        self._loading = False
+
+    def on_item_changed(self, item):
+        if self._loading or item.column() != C_ROW:
+            return
+        fid = self.table.item(item.row(), C_FILE).data(Qt.UserRole)
+        it = self.items.get(fid)
+        if not it:
+            return
+        txt = item.text().strip()
+        if not txt:
+            it["row"], it["row_how"] = None, ""
+        elif txt.isdigit() and int(txt) > 0:
+            it["row"], it["row_how"] = int(txt), "вручную"
+        else:
+            QMessageBox.warning(self, "Строка", "Номер строки — это целое число, например 80.")
+        self._refresh_row(fid)
+        self._save_session()
 
     def remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
         for r in rows:
-            fid = self.table.item(r, 0).data(Qt.UserRole)
+            fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             self.items.pop(fid, None)
             self.table.removeRow(r)
         self._save_session()
@@ -459,7 +633,7 @@ class MainWindow(QMainWindow):
 
     def selected_fid(self):
         rows = self.table.selectionModel().selectedRows()
-        return self.table.item(rows[0].row(), 0).data(Qt.UserRole) if rows else None
+        return self.table.item(rows[0].row(), C_FILE).data(Qt.UserRole) if rows else None
 
     # ------------------------------------------------------------------ details
     def on_select(self):
@@ -469,7 +643,7 @@ class MainWindow(QMainWindow):
         self.current = fid
         it = self.items.get(fid)
         enabled = it is not None
-        for w in (self.b_analyze, self.b_cut, self.tc_edit, self.mode):
+        for w in (self.b_analyze, self.b_cut, self.tc_edit, self.mode, self.b_to_sheet):
             w.setEnabled(enabled)
         if not it:
             self.info.setText("")
@@ -641,23 +815,185 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "Таймкоды", str(e))
             return
-        if not cuts:
+        if not cuts and not it.get("row"):
             QMessageBox.information(self, "Вырезать", "Вырезать нечего — в поле нет таймкодов (или «good»).")
             return
-        mode = self.mode.currentData()
-        try:
-            info = cutter.probe(it["path"])
-            mode = mode if info["video"] else "audio"
-            ext = (cutter.AUDIO_CONTAINER.get(info["audio"][0]["codec_name"], ".mka")
-                   if mode == "audio" and info["video"] and info["audio"] else os.path.splitext(it["path"])[1].lower())
-        except Exception as e:
-            QMessageBox.warning(self, "Ошибка", str(e))
+        mode = self.mode.currentData() if it.get("has_video") else None
+        if it.get("row") and not self._refresh_sheet_rows():
             return
-        out = cutter.default_output(it["path"], ext, suffix=self.extra.get("suffix", "_cut"),
-                                    out_dir=self.extra.get("out_dir") or None)
+        self._queue_cut(self.current, cuts, format_cuts(cuts, dur), mode)
+
+    # ------------------------------------------------------------------ Google Sheet
+    def open_sheet(self):
+        dlg = SheetDialog(self.sheet_cfg, self)
+        if dlg.exec():
+            self.sheet_cfg = dlg.values()
+            self.qs.setValue("sheet", json.dumps(self.sheet_cfg))
+            if self.sheet_cfg.get("url") and self.items:
+                self.find_rows()
+
+    def find_rows(self, quiet=False):
+        if not self.sheet_cfg.get("url"):
+            if not quiet:
+                QMessageBox.information(self, "Таблица", "Сначала подключите таблицу: кнопка «Таблица…».")
+            return
+        paths = [it["path"] for it in self.items.values() if it.get("row_how") != "вручную"]
+        self.worker.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
+                                     "cache_path": os.path.join(app_data_dir(), "titles.json")})
+        self.progress.setVisible(True)
+        self.status_text.setText("Ищу строки таблицы для файлов…")
+
+    def _apply_matches(self, res):
+        self.sheet_rows = {r["row"]: r for r in res["rows"]}
+        by_path = {it["path"]: fid for fid, it in self.items.items()}
+        found = 0
+        for path, (row, how) in res["matches"].items():
+            fid = by_path.get(path)
+            if fid is None or self.items[fid].get("row_how") == "вручную":
+                continue
+            self.items[fid]["row"], self.items[fid]["row_how"] = row, how
+            found += row is not None
+            self._refresh_row(fid)
+        missing = [os.path.basename(p) for p, (row, _) in res["matches"].items() if row is None]
+        self._save_session()
+        msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
+        if missing:
+            msg += f" Не найдены: {len(missing)} — укажите номер вручную (двойной щелчок в колонке «Строка»)."
+        self.status_text.setText(msg)
+
+    def _cuts_for(self, it):
+        """(cuts, canonical timecode string) for a file, from the edited field or the analysis."""
+        dur = it["result"]["duration"]
+        text = it["text"] if it["text"] is not None else it["result"]["timecodes"]
+        cuts = parse(text, dur)
+        return cuts, format_cuts(cuts, dur)
+
+    def _sheet_update(self, it, tc):
+        """What to write for this file (respecting existing cells), or None."""
+        if not (self.sheet_cfg.get("url") and it.get("row")):
+            return None
+        upd = {"row": it["row"]}
+        old = self.sheet_rows.get(it["row"], {})
+        if self.sheet_cfg.get("overwrite") or not (old.get("cuts") or "").strip() or old.get("cuts", "").strip() == tc:
+            upd["cuts"] = tc
+        acc = (it["result"] or {}).get("accent") or {}
+        if self.sheet_cfg.get("write_note", True) and acc and acc.get("top") != "британский" \
+                and not (old.get("note") or "").strip():
+            upd["note"] = ACCENT_NOTE.get(acc["top"], "НЕ БРИТАНСКИЙ АКЦЕНТ")
+        return upd if len(upd) > 1 else None
+
+    def _row_output(self, it, ext):
+        folder = self.extra.get("out_dir") or os.path.join(os.path.dirname(it["path"]), "готово")
+        name = f"{it['row']}{ext}"
+        out = os.path.join(folder, name)
+        if os.path.exists(out) and os.path.abspath(out) != os.path.abspath((it.get("cut") or {}).get("output", "")):
+            out = cutter.default_output(out, ext, suffix="", out_dir=folder)
+        return out
+
+    def _remember_written(self, upd):
+        row = self.sheet_rows.setdefault(upd["row"], {"row": upd["row"], "link": "", "cuts": "", "note": ""})
+        for k in ("cuts", "note"):
+            if k in upd:
+                row[k] = upd[k]
+
+    def cut_all(self):
+        todo, no_row, bad = [], [], []
+        for r in range(self.table.rowCount()):
+            fid = self.table.item(r, C_FILE).data(Qt.UserRole)
+            it = self.items[fid]
+            if not it["result"] or (it.get("cut") and it["status"].startswith("вырезано")):
+                continue
+            try:
+                cuts, tc = self._cuts_for(it)
+            except ValueError as e:
+                bad.append(f"{os.path.basename(it['path'])}: {e}")
+                continue
+            if not it.get("row"):
+                no_row.append(os.path.basename(it["path"]))
+            todo.append((fid, cuts, tc))
+        if not todo:
+            QMessageBox.information(self, "Вырезать все", "Нет проанализированных файлов, которые ещё не вырезаны.")
+            return
+        with_row = sum(1 for fid, _, _ in todo if self.items[fid].get("row"))
+        text = f"Будет обработано файлов: {len(todo)}.\n\n"
+        if with_row:
+            text += (f"{with_row} получат имя по номеру строки (например «{self.items[todo[0][0]].get('row') or 80}.m4a»)"
+                     f" в папке «{self.extra.get('out_dir') or 'готово'}»")
+            text += " и таймкоды будут записаны в таблицу.\n" if self.sheet_cfg.get("url") else ".\n"
+        if no_row:
+            text += f"\nБез номера строки ({len(no_row)}) — сохранятся как «имя_cut», в таблицу не попадут:\n  " + \
+                    "\n  ".join(no_row[:8]) + ("\n  …" if len(no_row) > 8 else "") + "\n"
+        if bad:
+            text += "\nПропущены из-за ошибок в таймкодах:\n  " + "\n  ".join(bad[:5]) + "\n"
+        text += "\nИсходные файлы не изменяются. Продолжить?"
+        if QMessageBox.question(self, "Вырезать все", text) != QMessageBox.Yes:
+            return
+        if not self._refresh_sheet_rows():
+            return
+        for fid, cuts, tc in todo:
+            self._queue_cut(fid, cuts, tc)
+
+    def _refresh_sheet_rows(self):
+        """Read the table again right before writing, so filled cells are never overwritten by accident."""
+        if not self.sheet_cfg.get("url"):
+            return True
+        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.sheet_rows = {r["row"]: r for r in SheetClient.from_config(self.sheet_cfg).rows()}
+            return True
+        except (SheetError, ValueError) as e:
+            QMessageBox.warning(self, "Таблица", f"Не удалось прочитать таблицу: {e}\n\nФайлы можно вырезать и без "
+                                                 "таблицы — отключите её в «Таблица…» (очистите адрес).")
+            return False
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+    def _queue_cut(self, fid, cuts, tc, mode=None):
+        it = self.items[fid]
+        ext = os.path.splitext(it["path"])[1].lower()
+        if mode == "audio" and it.get("has_video"):
+            info = cutter.probe(it["path"])
+            if info["audio"]:
+                ext = cutter.AUDIO_CONTAINER.get(info["audio"][0]["codec_name"], ".mka")
+        mode = mode or "auto"
+        if it.get("row"):
+            out = self._row_output(it, ext)
+        elif cuts:
+            out = cutter.default_output(it["path"], ext, suffix=self.extra.get("suffix", "_cut"),
+                                        out_dir=self.extra.get("out_dir") or None)
+        else:
+            return  # nothing to cut and no row to name it after
+        upd = self._sheet_update(it, tc)
         it["status"] = "в очереди на вырезание"
-        self._refresh_row(self.current)
-        self.worker.add(self.current, "cut", {"path": it["path"], "cuts": cuts, "mode": mode, "out_path": out})
+        self._refresh_row(fid)
+        self.worker.add(fid, "cut", {"path": it["path"], "cuts": cuts, "mode": mode, "out_path": out,
+                                     "sheet": {"cfg": self.sheet_cfg, "update": upd} if upd else None})
+        self.progress.setVisible(True)
+
+    def write_current_to_sheet(self):
+        it = self.items.get(self.current)
+        if not it:
+            return
+        if not self.sheet_cfg.get("url"):
+            QMessageBox.information(self, "Таблица", "Сначала подключите таблицу: кнопка «Таблица…».")
+            return
+        if not it.get("row"):
+            QMessageBox.information(self, "Таблица", "Для этого файла не найдена строка таблицы. Укажите её в колонке "
+                                                     "«Строка» (двойной щелчок).")
+            return
+        dur = (it["result"] or {}).get("duration") or cutter.probe(it["path"])["duration"]
+        try:
+            tc = format_cuts(parse(self.tc_edit.toPlainText(), dur), dur)
+        except ValueError as e:
+            QMessageBox.warning(self, "Таймкоды", str(e))
+            return
+        if not self._refresh_sheet_rows():
+            return
+        old = (self.sheet_rows.get(it["row"]) or {}).get("cuts", "").strip()
+        if old and old != tc and QMessageBox.question(
+                self, "Таблица", f"В строке {it['row']} уже записано:\n{old}\n\nЗаменить на:\n{tc}?") != QMessageBox.Yes:
+            return
+        self.worker.add(self.current, "sheet", {"cfg": self.sheet_cfg, "updates": [{"row": it["row"], "cuts": tc}]})
         self.progress.setVisible(True)
 
     def stop_all(self):
@@ -670,6 +1006,9 @@ class MainWindow(QMainWindow):
     def on_progress(self, fid, frac, text):
         it = self.items.get(fid)
         if not it:
+            self.progress.setVisible(True)
+            self.progress.setValue(int(frac * 100))
+            self.status_text.setText(text)
             return
         it["status"] = f"{text} {frac:.0%}"
         self._refresh_row(fid)
@@ -679,7 +1018,17 @@ class MainWindow(QMainWindow):
         self.status_text.setText(f"{os.path.basename(it['path'])}: {text}" + (f"   (в очереди ещё {left - 1})" if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "match":
+            self._apply_matches(res)
+            self._maybe_idle(keep_text=True)
+            return
         it = self.items.get(fid)
+        if kind == "sheet":
+            for u in res.get("updates", []):
+                self._remember_written(u)
+                self.status_text.setText(f"Строка {u['row']}: таймкоды записаны в таблицу.")
+            self._maybe_idle(keep_text=True)
+            return
         if it is not None:
             if kind == "analyze":
                 it["result"], it["text"], it["cut"] = res, None, None
@@ -688,6 +1037,12 @@ class MainWindow(QMainWindow):
                 it["cut"] = res
                 ok = (res.get("verification") or {}).get("lossless")
                 it["status"] = "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
+                if res.get("sheet") == "записано":
+                    it["status"] += ", в таблице ✓"
+                    self._remember_written(res["sheet_update"])
+                elif res.get("sheet"):
+                    it["status"] += ", таблица: ошибка"
+                    self.status_text.setText(f"Строка {it.get('row')}: {res['sheet']}")
             self._refresh_row(fid)
             if fid == self.current:
                 self._show_details(fid)
@@ -696,6 +1051,8 @@ class MainWindow(QMainWindow):
 
     def on_failed(self, fid, kind, msg):
         it = self.items.get(fid)
+        if it is None and msg != "остановлено":
+            QMessageBox.warning(self, "Таблица" if kind in ("match", "sheet") else "Ошибка", msg.split("\n\n")[0])
         if it is not None:
             it["status"] = "остановлено" if msg == "остановлено" else "ошибка"
             self._refresh_row(fid)
@@ -706,10 +1063,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", f"{os.path.basename(it['path'])}\n\n{msg}")
         self._maybe_idle()
 
-    def _maybe_idle(self):
+    def _maybe_idle(self, keep_text=False):
         if self.worker.pending <= 0:
             self.progress.setVisible(False)
-            self.status_text.setText("Готово")
+            if not keep_text:
+                self.status_text.setText("Готово")
 
     # ------------------------------------------------------------------ settings, export, session
     def open_settings(self):
@@ -726,13 +1084,14 @@ class MainWindow(QMainWindow):
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["Файл", "Длительность", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезанный файл", "Путь"])
+            w.writerow(["Файл", "Строка", "Длительность", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезанный файл",
+                        "Путь"])
             for r in range(self.table.rowCount()):
-                it = self.items[self.table.item(r, 0).data(Qt.UserRole)]
+                it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
                 res = it["result"] or {}
                 acc = (res.get("accent") or {}).get("groups") or {}
                 top = next(iter(acc.items()), None)
-                w.writerow([os.path.basename(it["path"]), fmt_time(res["duration"]) if res else "",
+                w.writerow([os.path.basename(it["path"]), it.get("row") or "", fmt_time(res["duration"]) if res else "",
                             it["text"] if it["text"] is not None else res.get("timecodes", ""),
                             f"{top[0]} {top[1]:.0%}" if top else "",
                             "" if not res.get("topic") else ("медицинская" if res["topic"]["medical"] else "проверить"),
@@ -745,9 +1104,12 @@ class MainWindow(QMainWindow):
     def _save_session(self):
         data = []
         for r in range(self.table.rowCount()):
-            it = self.items[self.table.item(r, 0).data(Qt.UserRole)]
-            st = it["status"] if it["status"] in ("готово", "вырезано ✓") or it["result"] else "ожидает анализа"
-            data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"]})
+            it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
+            st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else "ожидает анализа"
+            if it["result"] and not st.startswith(("готово", "вырезано")):
+                st = "готово"
+            data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
+                         "row": it.get("row"), "row_how": it.get("row_how", "")})
         try:
             with open(self._session_file(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)

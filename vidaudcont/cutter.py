@@ -204,6 +204,7 @@ def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, v
         raise CutError("результат нельзя записать поверх исходного файла")
     out_ext = os.path.splitext(out_path)[1].lower()
     folder = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(folder, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix=".vidaudcont-", dir=folder)
     faststart = ["-movflags", "+faststart"] if out_ext in MP4_LIKE else []
     try:

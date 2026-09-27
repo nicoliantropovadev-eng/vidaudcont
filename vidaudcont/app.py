@@ -94,6 +94,13 @@ def selftest(out_json=None, gui=False):
         check("звук из видео без потерь", rep["verification"]["lossless"] and rep["output"].endswith(".m4a"),
               rep["verification"])
         check("разбор таймкодов", parse("start-0:13, 3:10-3:17, 6:35-end", 400) == [(0, 13), (190, 197), (395, 400)])
+        from .matching import match_files
+        from .sheet import script_code
+        check("код скрипта для Google Таблицы", "const KEY = 'test-key';" in script_code("test-key"))
+        m = match_files([os.path.join(tmp, "Как работать с немотивированным пациентом.m4a")],
+                        [{"row": 5, "id": "4Y3EGPjhiXE"}],
+                        {"4Y3EGPjhiXE": {"ok": True, "ru": "Как работать с немотивированным пациентом?"}})
+        check("поиск строки по названию файла", list(m.values())[0][0] == 5, m)
 
         if gui:
             from PySide6.QtWidgets import QApplication

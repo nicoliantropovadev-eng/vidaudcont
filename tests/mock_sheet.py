@@ -1,0 +1,88 @@
+"""A stand-in for the Apps Script web app: same protocol, same POST-then-redirect dance as Google."""
+import json
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import re
+
+
+class MockSheet:
+    def __init__(self, grid, key="k"):
+        self.grid = grid  # list of rows (lists of str), row 1 = grid[0]
+        self.key = key
+        self.pending = {}
+        self.writes = []
+        server = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, obj, code=200):
+                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                if u.path == "/echo":
+                    return self._send(server.pending.pop(q.get("id"), {"ok": False, "error": "expired"}))
+                self._send(server.handle(q))
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(n) or b"{}")
+                token = str(len(server.pending) + len(server.writes) + 1)
+                server.pending[token] = server.handle(payload)
+                self.send_response(302)  # Google answers POSTs with a redirect to the result
+                self.send_header("Location", f"/echo?id={token}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/exec"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+    def cell(self, row, col):
+        line = self.grid[row - 1] if row - 1 < len(self.grid) else []
+        return line[col - 1] if col - 1 < len(line) else ""
+
+    def set(self, row, col, value):
+        while len(self.grid) < row:
+            self.grid.append([])
+        line = self.grid[row - 1]
+        while len(line) < col:
+            line.append("")
+        line[col - 1] = value
+
+    def handle(self, p):
+        if p.get("key") != self.key:
+            return {"ok": False, "error": "wrong key"}
+        link, cuts, note = int(p.get("link_col", 3)), int(p.get("cuts_col", 4)), int(p.get("note_col", 5))
+        if p.get("action") == "ping":
+            return {"ok": True, "spreadsheet": "Mock", "sheet": "Sheet1", "last_row": len(self.grid)}
+        if p.get("action") == "rows":
+            rows = []
+            for i in range(1, len(self.grid) + 1):
+                m = re.search(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]{11})", self.cell(i, link))
+                if m:
+                    rows.append({"row": i, "link": self.cell(i, link), "id": m.group(1),
+                                 "cuts": self.cell(i, cuts), "note": self.cell(i, note)})
+            return {"ok": True, "sheet": "Sheet1", "rows": rows}
+        if p.get("action") == "write":
+            for u in p.get("updates", []):
+                self.writes.append(u)
+                if u.get("cuts") is not None:
+                    self.set(int(u["row"]), cuts, u["cuts"])
+                if u.get("note") is not None:
+                    self.set(int(u["row"]), note, u["note"])
+            return {"ok": True, "written": len(p.get("updates", []))}
+        return {"ok": False, "error": "unknown action"}
