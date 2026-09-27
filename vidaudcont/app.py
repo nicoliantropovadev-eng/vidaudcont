@@ -27,7 +27,7 @@ def run_gui(files=()):
     from PySide6.QtWidgets import QApplication
 
     from .gui.main_window import MainWindow
-    from PySide6.QtCore import QStandardPaths, QUrl
+    from PySide6.QtCore import QLockFile, QStandardPaths, QUrl
     from PySide6.QtGui import QDesktopServices
     from PySide6.QtWidgets import QMessageBox
 
@@ -36,7 +36,14 @@ def run_gui(files=()):
     app.setStyle("Fusion")
     app.setApplicationName("VidAudCont")
     app.setOrganizationName("VidAudCont")
-    log_file, crashed = applog.setup(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation), __version__)
+    data_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+    os.makedirs(data_dir, exist_ok=True)
+    lock = QLockFile(os.path.join(data_dir, "vidaudcont.lock"))  # two copies would overwrite each other's list
+    lock.setStaleLockTime(0)  # only a lock of a program that is no longer running is stale
+    if not lock.tryLock(200):
+        QMessageBox.information(None, "VidAudCont", "Программа уже открыта — её окно на панели задач.")
+        return 0
+    log_file, crashed = applog.setup(data_dir, __version__)
     w = MainWindow()
     w.show()
     if crashed:
@@ -52,6 +59,7 @@ def run_gui(files=()):
         w.add_paths(list(files))
     code = app.exec()
     applog.clean_exit()
+    lock.unlock()
     return code
 
 

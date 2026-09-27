@@ -45,6 +45,15 @@ SETTING_LABELS = {
 }
 
 
+def _plain(o):
+    """For json: numbers from numpy and sets become plain numbers and lists; anything else becomes text."""
+    if hasattr(o, "item"):
+        return o.item()
+    if isinstance(o, (set, frozenset, tuple)):
+        return sorted(o, key=str)
+    return str(o)
+
+
 def app_data_dir():
     d = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
     os.makedirs(d, exist_ok=True)
@@ -477,6 +486,7 @@ class MainWindow(QMainWindow):
         self._scanning = False
         self.watch_found.connect(self._on_watch_found)
         self._row_index = {}  # fid -> table row, checked on every use and rebuilt when stale
+        self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
         self._rows_then = None  # what to do once the table has been read in the background
         self.save_timer = QTimer(self)  # many changes in a row end up in one write of the file list
         self.save_timer.setSingleShot(True)
@@ -1474,26 +1484,52 @@ class MainWindow(QMainWindow):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", "")})
+        data += self._missing
+        path = self._session_file()
         try:  # json.dumps uses the fast C encoder (json.dump would not); replace = never a half-written file
-            text = json.dumps(data, ensure_ascii=False)
-            tmp = self._session_file() + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            text = json.dumps(data, ensure_ascii=False, default=_plain)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
                 f.write(text)
-            os.replace(tmp, self._session_file())
-        except OSError:
-            pass
+            if os.path.exists(path):
+                os.replace(path, path + ".bak")  # the previous list stays as a spare copy
+            os.replace(path + ".tmp", path)
+        except Exception as e:  # never lose the window over this, but leave a trace
+            log_event(f"не удалось сохранить список файлов: {e!r}")
 
     def _restore_session(self):
-        try:
-            with open(self._session_file(), encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+        path, data = self._session_file(), None
+        for name in (path, path + ".bak"):
+            try:
+                with open(name, encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as e:  # kept aside, not overwritten: the results in it can be recovered
+                keep = f"{path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+                log_event(f"сохранённый список не читается ({os.path.basename(name)}: {e}), отложен в {keep}")
+                try:
+                    os.replace(name, keep)
+                except OSError:
+                    pass
+        if not isinstance(data, list):
             return
         for d in data:
-            if os.path.exists(d.get("path", "")):
-                if d.get("result") is None and d.get("status") != "ошибка":  # it was waiting or being analysed
-                    d["status"] = "ожидает анализа"
-                self._add_item(d["path"], d)
+            if not isinstance(d, dict):
+                continue
+            if not os.path.exists(d.get("path", "")):
+                self._missing.append(d)
+                continue
+            if d.get("result") is None and d.get("status") != "ошибка":  # it was waiting or being analysed
+                d["status"] = "ожидает анализа"
+            self._add_item(d["path"], d)
+        log_event(f"список файлов восстановлен: {len(self.items)}, нет на диске: {len(self._missing)}")
+        if self._missing:
+            names = "\n".join(os.path.basename(d.get("path", "")) for d in self._missing[:5])
+            QTimer.singleShot(500, lambda: QMessageBox.information(
+                self, "Список файлов", f"Файлов из списка нет на прежнем месте: {len(self._missing)}\n{names}"
+                + ("\n…" if len(self._missing) > 5 else "") + "\n\nОни перемещены, удалены или диск не подключён. "
+                "Их результаты сохранены: верните файлы на место и перезапустите программу."))
 
     def closeEvent(self, ev):
         self._write_session()

@@ -20,8 +20,8 @@ def fresh_app_state():
     QStandardPaths.setTestModeEnabled(True)
     QSettings("VidAudCont", "VidAudCont").clear()
     d = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-    for name in ("session.json", "titles.json"):
-        if os.path.exists(os.path.join(d, name)):
+    for name in os.listdir(d) if os.path.isdir(d) else []:
+        if name.startswith(("session.json", "titles.json")):  # with the spare and put-aside copies
             os.remove(os.path.join(d, name))
 
 
@@ -232,3 +232,48 @@ def test_window_never_waits_for_the_folder_or_the_file_list(tmp_path, monkeypatc
     saved = json.load(open(session, encoding="utf-8"))
     assert len(saved) == 6 and saved[0]["status"] == "ошибка"  # a failed file is not analysed again on start
     w.close()
+
+
+def test_file_list_survives_a_restart_and_bad_files(tmp_path, monkeypatch):
+    """Closing and opening the window brings the list back; a damaged list is put aside (not overwritten),
+    the spare copy is used, and entries whose file is missing are kept for when it comes back."""
+    import json
+
+    import numpy as np
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    from vidaudcont.gui.main_window import MainWindow
+    here = tmp_path / "есть.m4a"
+    shutil.copy(resources.asset("selftest.m4a"), here)
+    result = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [], "hints": [],
+              "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "accent": None, "topic": None, "transcript": "",
+              "speech_db": np.float32(-20.5)}          # a stray numpy number must not stop the saving
+    w = MainWindow()
+    w.add_paths([str(here)])
+    fid = next(iter(w.items))
+    w.items[fid].update(result=result, status="готово", row=80, row_how="название")
+    w.close()                                            # writes the list
+    session = w._session_file()
+    w2 = MainWindow()
+    assert [(it["row"], it["result"]["timecodes"]) for it in w2.items.values()] == [(80, "start-0:05")]
+    w2.close()
+
+    gone = {"path": str(tmp_path / "перенесён.m4a"), "status": "готово", "result": result | {"speech_db": 1.0},
+            "text": None, "cut": None, "row": 81, "row_how": ""}
+    saved = json.load(open(session, encoding="utf-8"))
+    json.dump(saved + [gone], open(session, "w", encoding="utf-8"), ensure_ascii=False)
+    w3 = MainWindow()                                    # the missing file is not shown, but kept
+    assert len(w3.items) == 1 and len(w3._missing) == 1
+    w3._write_session()
+    assert [d["row"] for d in json.load(open(session, encoding="utf-8"))] == [80, 81]
+    w3.close()
+
+    good = open(session, encoding="utf-8").read()
+    open(session + ".bak", "w", encoding="utf-8").write(good)
+    open(session, "w", encoding="utf-8").write(good[: len(good) // 2])  # cut off, as by a killed program
+    w4 = MainWindow()
+    assert len(w4.items) == 1                            # taken from the spare copy
+    broken = [n for n in os.listdir(os.path.dirname(session)) if ".broken-" in n]
+    assert broken                                        # the damaged list is kept aside for recovery
+    w4.close()
