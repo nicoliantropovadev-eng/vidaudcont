@@ -9,7 +9,7 @@ import time
 import traceback
 from dataclasses import asdict, fields
 
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__, cutter
-from ..engine.analyzer import Models, Settings, analyze
+from ..engine.analyzer import Settings, default_threads
+from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import FolderWatcher, select_links, write_links
 from ..matching import TitleCache, match_files
@@ -50,8 +51,15 @@ def app_data_dir():
     return d
 
 
+class PoolSignals(QObject):
+    """Brings the analysis pool's callbacks (called from its threads) into the window's thread."""
+    progress = Signal(int, float, str)
+    done = Signal(int, str, object)
+    failed = Signal(int, str, str)
+
+
 class Worker(QThread):
-    """Runs analyses and cuts one after another, away from the UI thread."""
+    """Runs cuts, or table and row-search jobs, one after another, away from the UI thread."""
     progress = Signal(int, float, str)
     done = Signal(int, str, object)
     failed = Signal(int, str, str)
@@ -60,7 +68,6 @@ class Worker(QThread):
         super().__init__(parent)
         self.jobs = queue.Queue()
         self.cancel_flag = threading.Event()
-        self.models = None
         self.pending = 0
 
     def add(self, fid, kind, payload):
@@ -91,14 +98,7 @@ class Worker(QThread):
             self.cancel_flag.clear()
             report = lambda f, t: self.progress.emit(fid, float(f), t)  # noqa: E731
             try:
-                if kind == "analyze":
-                    if self.models is None:
-                        report(0.0, "загрузка моделей (первый раз дольше)")
-                        self.models = Models(threads=payload["settings"].threads)
-                    self.models.set_threads(payload["settings"].threads)
-                    res = analyze(payload["path"], self.models, payload["settings"], progress=report,
-                                  cancelled=self.cancel_flag.is_set)
-                elif kind == "match":
+                if kind == "match":
                     res = self._match(payload, report)
                 elif kind == "sheet":
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
@@ -475,16 +475,23 @@ class MainWindow(QMainWindow):
         if self.watching and self.watch_dir:
             self.watch_timer.start()
 
-        self.worker = Worker(self)  # analyses and cuts, one after another
+        self.worker = Worker(self)  # cuts, one after another
         self.net = Worker(self)     # row search and table writes: network only, runs next to the analysis
-        for w in (self.worker, self.net):
+        self.pool_signals = PoolSignals(self)
+        for w in (self.worker, self.net, self.pool_signals):
             w.progress.connect(self.on_progress)
             w.done.connect(self.on_done)
             w.failed.connect(self.on_failed)
-            w.start()
+        self.worker.start()
+        self.net.start()
+        sig = self.pool_signals
+        self.pool = AnalysisPool(sig.progress.emit, lambda fid, res: sig.done.emit(fid, "analyze", res),
+                                 lambda fid, msg: sig.failed.emit(fid, "analyze", msg))
+        self._configure_pool()
 
         self._build_ui()
         self._restore_session()
+        self._resume()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -928,8 +935,23 @@ class MainWindow(QMainWindow):
         it = self.items[fid]
         it["status"] = "в очереди"
         self._refresh_row(fid)
-        self.worker.add(fid, "analyze", {"path": it["path"], "settings": Settings(**asdict(self.settings))})
+        self.pool.add(fid, it["path"], asdict(self.settings))
         self.progress.setVisible(True)
+
+    def _configure_pool(self):
+        """Several files at once: the processor threads from the settings are shared between them."""
+        n, each = self.pool.configure(self.settings.threads or default_threads())
+        log_event(f"анализ: файлов одновременно {n}, потоков на файл {each}")
+
+    def _resume(self):
+        """Work left from the previous run goes on by itself: files without analysis, rows not found yet."""
+        if self.auto_analyze:
+            for fid, it in self.items.items():
+                if it["result"] is None and it["status"] == "ожидает анализа":
+                    self._queue_analysis(fid)
+        if self.sheet_cfg.get("url") and any(not it.get("row") and it.get("row_how") != "вручную"
+                                             for it in self.items.values()):
+            self.find_rows(quiet=True)
 
     def cut_current(self):
         it = self.items.get(self.current)
@@ -1227,6 +1249,10 @@ class MainWindow(QMainWindow):
 
     def stop_all(self):
         self.match_timer.stop()
+        for fid in self.pool.cancel_all():
+            if fid in self.items:
+                self.items[fid]["status"] = "остановлено"
+                self._refresh_row(fid)
         for fid, kind, _ in self.worker.cancel_all() + self.net.cancel_all():
             if kind == "match":
                 self._match_queued = False
@@ -1238,7 +1264,7 @@ class MainWindow(QMainWindow):
     def on_progress(self, fid, frac, text):
         it = self.items.get(fid)
         if not it:
-            if self.worker.pending > 0:  # a row search next to a running analysis: the analysis keeps the status line
+            if self.worker.pending > 0 or self.pool.pending > 0:  # the analysis or cut keeps the status line
                 return
             self.progress.setVisible(True)
             self.progress.setValue(int(frac * 100))
@@ -1248,8 +1274,9 @@ class MainWindow(QMainWindow):
         self._refresh_row(fid)
         self.progress.setVisible(True)
         self.progress.setValue(int(frac * 100))
-        left = self.worker.pending
-        self.status_text.setText(f"{os.path.basename(it['path'])}: {text}" + (f"   (в очереди ещё {left - 1})" if left > 1 else ""))
+        left = self.pool.pending + self.worker.pending
+        self.status_text.setText(f"{os.path.basename(it['path'])}: {text}" + (f"   (в работе и в очереди ещё {left - 1})"
+                                                                               if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
         if kind == "match":
@@ -1324,7 +1351,7 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def _maybe_idle(self, keep_text=False):
-        if self.worker.pending <= 0 and self.net.pending <= 0:
+        if self.worker.pending <= 0 and self.net.pending <= 0 and self.pool.pending <= 0:
             self.progress.setVisible(False)
             if not keep_text:
                 n = len(self._unwritten())
@@ -1338,6 +1365,7 @@ class MainWindow(QMainWindow):
             self.settings, self.extra = dlg.values()
             self.qs.setValue("settings", json.dumps(asdict(self.settings)))
             self.qs.setValue("extra", json.dumps(self.extra))
+            self._configure_pool()
             self.status_text.setText("Настройки сохранены. Новые пороги применятся при следующем анализе.")
 
     def export_csv(self):
@@ -1386,13 +1414,14 @@ class MainWindow(QMainWindow):
             return
         for d in data:
             if os.path.exists(d.get("path", "")):
-                if d.get("result") is None:
+                if d.get("result") is None and d.get("status") != "ошибка":  # it was waiting or being analysed
                     d["status"] = "ожидает анализа"
                 self._add_item(d["path"], d)
 
     def closeEvent(self, ev):
         self._save_session()
         self.match_timer.stop()
+        self.pool.stop()
         self.worker.stop()
         self.net.stop()
         super().closeEvent(ev)

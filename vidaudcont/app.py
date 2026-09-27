@@ -6,6 +6,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -89,6 +90,28 @@ def selftest(out_json=None, gui=False):
             check(f"речь {a}-{b} с сохранена", cover(a, b) <= 0.2, f"вырезано {cover(a, b):.0%}")
         check("акцент британский", r["accent"] and r["accent"]["top"] == "британский", r["accent"] and r["accent"]["groups"])
         check("расшифровка для темы", bool(r["transcript"].strip()), r["transcript"][:80])
+
+        from dataclasses import asdict
+
+        from .engine.analyzer import Settings
+        from .engine.pool import AnalysisPool
+        got, failed, finished = {}, {}, threading.Event()
+
+        def keep(store):
+            def f(fid, value):
+                store[fid] = value
+                if len(got) + len(failed) == 2:
+                    finished.set()
+            return f
+        pool = AnalysisPool(lambda *a: None, keep(got), keep(failed))
+        pool.configure(2, workers=2)
+        for fid in (1, 2):
+            pool.add(fid, src, asdict(Settings()))
+        finished.wait(900)
+        pool.stop()
+        check("два файла одновременно, в отдельных процессах",
+              len(got) == 2 and all(g["timecodes"] == r["timecodes"] for g in got.values()),
+              failed or [g["timecodes"] for g in got.values()])
 
         rep = cutter.cut(src, [(c["start"], c["end"]) for c in cuts])
         check("вырезание m4a без потерь", rep["verification"]["lossless"], rep["verification"])
