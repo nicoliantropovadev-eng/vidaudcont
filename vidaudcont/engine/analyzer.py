@@ -150,6 +150,24 @@ def _torch_amp_compat(torch):
     torch.amp.custom_fwd, torch.amp.custom_bwd = custom_fwd, custom_bwd
 
 
+def _load_state(torch, path):
+    """torch.load through a Python file object (Unicode-safe on Windows)."""
+    with open(path, "rb") as f:
+        return torch.load(f, map_location="cpu")
+
+
+def load_whisper(models_dir, threads):
+    """Whisper base.en loaded from memory: CTranslate2 opens files by narrow path, which breaks on
+    Windows when the program sits in a folder with non-Latin letters."""
+    from faster_whisper import WhisperModel
+    d = os.path.join(models_dir, "whisper-base.en")
+    files = {}
+    for name in ("model.bin", "config.json", "vocabulary.txt", "tokenizer.json"):
+        with open(os.path.join(d, name), "rb") as f:
+            files[name] = f.read()
+    return WhisperModel("whisper-base.en", device="cpu", compute_type="int8", cpu_threads=threads, files=files)
+
+
 class Models:
     """Lazily loaded models, shared by all analyses in the process."""
 
@@ -168,8 +186,13 @@ class Models:
     def vad(self):
         with self._lock:
             if self._vad is None:
-                from silero_vad import load_silero_vad
-                self._vad = load_silero_vad()
+                import io
+
+                import silero_vad
+                import torch
+                path = os.path.join(os.path.dirname(silero_vad.__file__), "data", "silero_vad.jit")
+                with open(path, "rb") as f:  # torch.jit.load(path) fails on Windows for D:\Загрузки\...
+                    self._vad = torch.jit.load(io.BytesIO(f.read()), map_location="cpu").eval()
             return self._vad
 
     def tagger(self):
@@ -181,8 +204,7 @@ class Models:
                 from .efficientat.mn.utils import NAME_TO_WIDTH
                 from .efficientat.preprocess import AugmentMelSTFT
                 model = get_model(width_mult=NAME_TO_WIDTH("mn10_as"), pretrained_name=None)
-                sd = torch.load(os.path.join(self.dir, "efficientat", "mn10_as_mAP_471.pt"), map_location="cpu")
-                model.load_state_dict(sd)
+                model.load_state_dict(_load_state(torch, os.path.join(self.dir, "efficientat", "mn10_as_mAP_471.pt")))
                 mel = AugmentMelSTFT(n_mels=128, sr=32000, win_length=800, hopsize=320)
                 self._tagger = (model.eval(), mel.eval(), load_labels())
             return self._tagger
@@ -203,8 +225,8 @@ class Models:
                                  kernel_sizes=[5, 3, 3, 3, 1], dilations=[1, 2, 3, 4, 1], attention_channels=128,
                                  lin_neurons=192)
                 clf = Classifier(input_size=192, out_neurons=16)
-                emb.load_state_dict(torch.load(os.path.join(d, "embedding_model.ckpt"), map_location="cpu"))
-                clf.load_state_dict(torch.load(os.path.join(d, "classifier.ckpt"), map_location="cpu"))
+                emb.load_state_dict(_load_state(torch, os.path.join(d, "embedding_model.ckpt")))
+                clf.load_state_dict(_load_state(torch, os.path.join(d, "classifier.ckpt")))
                 labels = {}
                 with open(os.path.join(d, "accent_encoder.txt"), encoding="utf-8") as f:
                     for line in f:
@@ -217,9 +239,7 @@ class Models:
     def asr(self):
         with self._lock:
             if self._asr is None:
-                from faster_whisper import WhisperModel
-                self._asr = WhisperModel(os.path.join(self.dir, "whisper-base.en"), device="cpu",
-                                         compute_type="int8", cpu_threads=self.threads)
+                self._asr = load_whisper(self.dir, self.threads)
             return self._asr
 
 

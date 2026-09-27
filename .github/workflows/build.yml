@@ -79,18 +79,26 @@ jobs:
       - name: Build
         run: pyinstaller vidaudcont.spec --noconfirm
 
-      - name: Self-test of the built app (Windows)
+      - name: Self-test of the built app (Windows, from a folder with Cyrillic letters)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist\VidAudCont\VidAudCont.exe" -ArgumentList "--selftest-gui","--json","selftest.json" -Wait -PassThru
-          Get-Content selftest.json -Encoding utf8
+          # users keep it in folders like D:\Загрузки - native libraries must cope with that
+          $dst = Join-Path $env:RUNNER_TEMP "Загрузки тест"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Recurse -Force "dist\VidAudCont" $dst
+          $exe = Join-Path $dst "VidAudCont\VidAudCont.exe"
+          $out = Join-Path $env:GITHUB_WORKSPACE "selftest.json"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest-gui","--json","`"$out`"" -Wait -PassThru
+          Get-Content $out -Encoding utf8
           if ($p.ExitCode -ne 0) { exit 1 }
 
-      - name: Self-test of the built app (macOS)
+      - name: Self-test of the built app (macOS, from a folder with Cyrillic letters)
         if: runner.os == 'macOS'
         run: |
-          dist/VidAudCont.app/Contents/MacOS/VidAudCont --selftest-gui --json selftest.json
+          dst="$RUNNER_TEMP/Загрузки тест"
+          mkdir -p "$dst" && ditto dist/VidAudCont.app "$dst/VidAudCont.app"
+          "$dst/VidAudCont.app/Contents/MacOS/VidAudCont" --selftest-gui --json selftest.json
           cat selftest.json
           # which macOS the bundle needs: the newest minimum among all bundled binaries
           find dist/VidAudCont.app -type f \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) -print0 \

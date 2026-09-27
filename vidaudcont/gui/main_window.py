@@ -699,6 +699,8 @@ class MainWindow(QMainWindow):
         if it is not None:
             it["status"] = "остановлено" if msg == "остановлено" else "ошибка"
             self._refresh_row(fid)
+            if fid == self.current:
+                self._show_details(fid)
             if msg != "остановлено":
                 self.status_text.setText(f"{os.path.basename(it['path'])}: ошибка")
                 QMessageBox.warning(self, "Ошибка", f"{os.path.basename(it['path'])}\n\n{msg}")

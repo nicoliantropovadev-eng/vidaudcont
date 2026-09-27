@@ -29,7 +29,8 @@ a = Analysis(["run_vidaudcont.py"], pathex=["."], binaries=binaries, datas=datas
              noarchive=False)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="VidAudCont", console=False, upx=False,
-          disable_windowed_traceback=False, argv_emulation=False)
+          disable_windowed_traceback=False, argv_emulation=False,
+          manifest=open("windows.manifest", encoding="utf-8").read() if sys.platform == "win32" else None)
 coll = COLLECT(exe, a.binaries, a.datas, upx=False, name="VidAudCont")
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="VidAudCont.app", bundle_identifier="app.vidaudcont",

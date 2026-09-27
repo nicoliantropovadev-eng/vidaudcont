@@ -27,6 +27,7 @@ def run_gui(files=()):
 
     from .gui.main_window import MainWindow
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    app.setStyle("Fusion")
     app.setApplicationName("VidAudCont")
     app.setOrganizationName("VidAudCont")
     w = MainWindow()
@@ -133,14 +134,12 @@ def main(argv=None):
 
     if a.transcribe_clips:  # helper process: Whisper only, torch is never imported here
         import numpy as np
-        from faster_whisper import WhisperModel
 
-        from .engine.analyzer import transcribe
+        from .engine.analyzer import load_whisper, transcribe
         src, dst = a.transcribe_clips
         with np.load(src) as z:
             clips = [z[k] for k in sorted(z.files, key=lambda k: int(k.split("_")[1]))]
-        model = WhisperModel(os.path.join(resources.models_dir(), "whisper-base.en"), device="cpu",
-                             compute_type="int8", cpu_threads=a.threads or max(1, (os.cpu_count() or 2) - 1))
+        model = load_whisper(resources.models_dir(), a.threads or max(1, (os.cpu_count() or 2) - 1))
         with open(dst, "w", encoding="utf-8") as f:
             json.dump(transcribe(model, clips), f, ensure_ascii=False)
         return 0
