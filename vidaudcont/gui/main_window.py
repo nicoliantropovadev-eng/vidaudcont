@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__, cutter
-from ..engine.analyzer import Settings, default_threads
+from ..engine.analyzer import Settings, default_threads, suitability
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import FolderWatcher, norm_path, select_links, write_links
@@ -42,6 +42,8 @@ SETTING_LABELS = {
     "threads": ("Потоков процессора для анализа (0 = половина)", 0, 64, 1),
     "accent": ("Определять акцент", None, None, None),
     "topic": ("Проверять тему (медицинская ли)", None, None, None),
+    "dialogue": ("Определять, разговор ли это (два голоса по очереди)", None, None, None),
+    "only_suitable": ("«Вырезать все»: только разговоры на медицинскую тему с британским акцентом", None, None, None),
 }
 
 
@@ -114,7 +116,8 @@ class Worker(QThread):
                                                            cancelled=self.cancel_flag.is_set).rows()}
                 elif kind == "sheet":
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
-                    res = {"sheet": "записано", "updates": payload["updates"], "fids": payload.get("fids", [])}
+                    res = {"sheet": "записано", "updates": payload["updates"], "fids": payload.get("fids", []),
+                           "noted": payload.get("noted", [])}
                 else:
                     res = self._cut(payload, report)
                 self.done.emit(fid, kind, res)
@@ -300,7 +303,8 @@ class SheetDialog(QDialog):
             cols.addWidget(w)
         cols.addStretch(1)
         form.addRow("Колонки", cols)
-        self.write_note = QCheckBox("Писать в колонку пометок «АМЕРИКАНСКИЙ АКЦЕНТ» и т.п., если там пусто")
+        self.write_note = QCheckBox("Писать в колонку пометок, почему видео не подходит («НЕ РАЗГОВОР», "
+                                    "«АМЕРИКАНСКИЙ АКЦЕНТ»…), если там пусто")
         self.write_note.setChecked(self.cfg.get("write_note", True))
         form.addRow(self.write_note)
         self.overwrite = QCheckBox("Перезаписывать таймкоды, которые уже есть в таблице")
@@ -368,7 +372,7 @@ class DownloaderDialog(QDialog):
         rng.addWidget(self.last)
         rng.addStretch(1)
         form.addRow("Строки таблицы", rng)
-        self.skip_filled = QCheckBox("пропустить строки, где уже есть таймкоды (колонка D)")
+        self.skip_filled = QCheckBox("пропустить строки, где уже есть таймкоды (D) или пометка (E)")
         self.skip_filled.setChecked(True)
         self.skip_have = QCheckBox("пропустить видео, файлы которых уже есть в программе")
         self.skip_have.setChecked(True)
@@ -446,12 +450,10 @@ class DownloaderDialog(QDialog):
         return self.watch_dir.text().strip(), self.watching.isChecked(), self.auto_analyze.isChecked()
 
 
-ACCENT_NOTE = {"американский": "АМЕРИКАНСКИЙ АКЦЕНТ", "ирландский": "ИРЛАНДСКИЙ АКЦЕНТ",
-               "австралийский": "АВСТРАЛИЙСКИЙ АКЦЕНТ", "индийский": "ИНДИЙСКИЙ АКЦЕНТ", "другой": "НЕ БРИТАНСКИЙ АКЦЕНТ"}
-
-COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Вырезано"]
-COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 90]
-C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_CUT = range(8)
+COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Подходит", "Вырезано"]
+COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 150, 90]
+C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_FIT, C_CUT = range(9)
+SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина"}
 MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
 
 
@@ -487,6 +489,7 @@ class MainWindow(QMainWindow):
         self.watch_found.connect(self._on_watch_found)
         self._row_index = {}  # fid -> table row, checked on every use and rebuilt when stale
         self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
+        self._dialogue_pending = set()  # files whose conversation check is queued
         self._rows_then = None  # what to do once the table has been read in the background
         self.save_timer = QTimer(self)  # many changes in a row end up in one write of the file list
         self.save_timer.setSingleShot(True)
@@ -508,8 +511,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self.net.start()
         sig = self.pool_signals
-        self.pool = AnalysisPool(sig.progress.emit, lambda fid, res: sig.done.emit(fid, "analyze", res),
-                                 lambda fid, msg: sig.failed.emit(fid, "analyze", msg))
+        self.pool = AnalysisPool(sig.progress.emit, sig.done.emit, sig.failed.emit)
         self._configure_pool()
 
         self._build_ui()
@@ -706,7 +708,8 @@ class MainWindow(QMainWindow):
         it = {"path": path, "status": "ожидает анализа", "result": None, "text": None, "cut": None,
               "row": None, "row_how": ""}
         if state:
-            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how") if k in state})
+            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted")
+                       if k in state})
         self.items[fid] = it
         self._loading = True
         r = self.table.rowCount()
@@ -767,6 +770,18 @@ class MainWindow(QMainWindow):
         t_item = self.table.item(r, C_TOPIC)
         t_item.setText("" if not topic else ("медицинская" if topic.get("medical") else "проверьте"))
         t_item.setForeground(QColor("#2e7d32") if topic and topic.get("medical") else QColor("#ef6c00"))
+        fit_item = self.table.item(r, C_FIT)
+        why = suitability(res) if res else None
+        if why is None:
+            fit_item.setText("проверяется…" if res and self.settings.dialogue else "")
+            fit_item.setForeground(QColor("#607d8b"))
+        else:
+            fit_item.setText("✓ да" if not why else "✗ " + ", ".join(SHORT_WHY.get(w, w.lower()) for w in why))
+            fit_item.setForeground(QColor("#2e7d32") if not why else QColor("#c62828"))
+        d = (res or {}).get("dialogue") or {}
+        fit_item.setToolTip(("Не подходит: " + ", ".join(why) + "\n" if why else "") + (
+            f"Голосов: {'два' if d.get('separation', 0) >= 0.15 else 'один'}, реплики сменяются {d['turns_per_min']} раз "
+            f"в минуту речи" if "turns_per_min" in d else d.get("reason", "")))
         cut = it.get("cut")
         cut_item = self.table.item(r, C_CUT)
         cut_item.setText(("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
@@ -868,6 +883,15 @@ class MainWindow(QMainWindow):
             if acc.get("non_british") and good:
                 out.append("&nbsp;&nbsp;не британский на участках: " + ", ".join(
                     f"{o['group']} {fmt_time(o['start'])}–{fmt_time(o['end'])}" for o in acc["non_british"]))
+        d = res.get("dialogue")
+        if d:
+            if d.get("conversation"):
+                out.append("<b>Разговор:</b> <span style='color:#2e7d32'>да</span> — два голоса, реплики сменяются "
+                           f"{d['turns_per_min']} раз в минуту речи")
+            elif d.get("conversation") is False:
+                out.append(f"<b>Разговор:</b> <span style='color:#c62828'>нет</span> — {d['reason']}")
+            else:
+                out.append(f"<b>Разговор:</b> {d['reason']}")
         top = res.get("topic")
         if top:
             if top["medical"]:
@@ -953,6 +977,7 @@ class MainWindow(QMainWindow):
             self._queue_analysis(self.current)
 
     def analyze_all(self):
+        self._check_dialogues()
         n = 0
         for fid, it in self.items.items():
             if it["result"] is None and not it["status"].startswith(("в очереди", "анализ")):
@@ -968,6 +993,18 @@ class MainWindow(QMainWindow):
         self.pool.add(fid, it["path"], asdict(self.settings))
         self.progress.setVisible(True)
 
+    def _check_dialogues(self):
+        """Files analysed before the conversation check existed get only that check (seconds, not a new analysis)."""
+        if not self.settings.dialogue:
+            return
+        for fid, it in self.items.items():
+            res = it.get("result")
+            if res and "dialogue" not in res and res.get("segments") is not None and fid not in self._dialogue_pending:
+                self._dialogue_pending.add(fid)
+                self.pool.add(fid, it["path"], asdict(self.settings), kind="dialogue",
+                              extra={"segments": res["segments"]})
+                self.progress.setVisible(True)
+
     def _configure_pool(self):
         """Several files at once: the processor threads from the settings are shared between them."""
         n, each = self.pool.configure(self.settings.threads or default_threads())
@@ -979,6 +1016,7 @@ class MainWindow(QMainWindow):
             for fid, it in self.items.items():
                 if it["result"] is None and it["status"] == "ожидает анализа":
                     self._queue_analysis(fid)
+        self._check_dialogues()
         if self.sheet_cfg.get("url") and any(not it.get("row") and it.get("row_how") != "вручную"
                                              for it in self.items.values()):
             self.find_rows(quiet=True)
@@ -1142,10 +1180,9 @@ class MainWindow(QMainWindow):
         old = self.sheet_rows.get(it["row"], {})
         if self.sheet_cfg.get("overwrite") or not (old.get("cuts") or "").strip() or old.get("cuts", "").strip() == tc:
             upd["cuts"] = tc
-        acc = (it["result"] or {}).get("accent") or {}
-        if self.sheet_cfg.get("write_note", True) and acc and acc.get("top") != "британский" \
-                and not (old.get("note") or "").strip():
-            upd["note"] = ACCENT_NOTE.get(acc["top"], "НЕ БРИТАНСКИЙ АКЦЕНТ")
+        why = suitability(it["result"] or {})
+        if self.sheet_cfg.get("write_note", True) and why and not (old.get("note") or "").strip():
+            upd["note"] = " + ".join(why)
         return upd if len(upd) > 1 else None
 
     def _row_output(self, it, ext):
@@ -1163,7 +1200,7 @@ class MainWindow(QMainWindow):
                 row[k] = upd[k]
 
     def cut_all(self):
-        todo, no_row, bad = [], [], []
+        todo, no_row, bad, unfit, unchecked = [], [], [], [], []
         for r in range(self.table.rowCount()):
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             it = self.items[fid]
@@ -1178,9 +1215,18 @@ class MainWindow(QMainWindow):
                 no_row.append(os.path.basename(it["path"]))
                 if self.sheet_cfg.get("url"):  # they wait for their row: cut as "name_cut" they would be lost
                     continue
+            if self.settings.only_suitable:
+                why = suitability(it["result"])
+                if why is None and self.settings.dialogue:
+                    unchecked.append(os.path.basename(it["path"]))
+                    continue
+                if why:
+                    if not it.get("noted"):
+                        unfit.append((fid, tc, why))
+                    continue
             todo.append((fid, cuts, tc))
         unwritten = self._unwritten() if self.sheet_cfg.get("url") else []
-        if not todo and not unwritten:
+        if not todo and not unwritten and not unfit:
             text = "Нет проанализированных файлов, которые ещё не вырезаны."
             if no_row:
                 text = (f"У всех проанализированных файлов ({len(no_row)}) пока нет номера строки таблицы. "
@@ -1198,6 +1244,14 @@ class MainWindow(QMainWindow):
                      ("пока не вырезаются. Нажмите «Найти строки» или впишите номер вручную двойным щелчком в "
                       "колонке «Строка»" if self.sheet_cfg.get("url") else "сохранятся как «имя_cut»") + ":\n  " +
                      "\n  ".join(no_row[:8]) + ("\n  …" if len(no_row) > 8 else "") + "\n")
+        if unfit:
+            names = [f"{os.path.basename(self.items[f]['path'])} — {', '.join(w).lower()}" for f, _, w in unfit]
+            text += (f"\nНе подходят ({len(unfit)}) — не вырезаются" + (", причина запишется в колонку E"
+                     if self.sheet_cfg.get("url") else "") + ":\n  " + "\n  ".join(names[:8])
+                     + ("\n  …" if len(names) > 8 else "") + "\n")
+        if unchecked:
+            text += (f"\nЕщё проверяются, разговор ли это ({len(unchecked)}) — вырежутся при следующем нажатии, "
+                     "если подойдут.\n")
         if bad:
             text += "\nПропущены из-за ошибок в таймкодах:\n  " + "\n  ".join(bad[:5]) + "\n"
         if unwritten:
@@ -1211,7 +1265,26 @@ class MainWindow(QMainWindow):
             for fid, cuts, tc in todo:
                 self._queue_cut(fid, cuts, tc)
             self._queue_rewrite(unwritten)
+            self._queue_notes(unfit)
         self._after_fresh_rows(start)
+
+    def _queue_notes(self, unfit):
+        """Files that do not fit: not cut; their timecodes and the reason go to the table (D and E)."""
+        updates, fids = [], []
+        for fid, tc, why in unfit:
+            it = self.items[fid]
+            it["status"] = "не подходит"
+            self._refresh_row(fid)
+            upd = self._sheet_update(it, tc)
+            if upd:
+                updates.append(upd)
+                fids.append(fid)
+            else:
+                it["noted"] = True
+        if updates:
+            self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": updates, "noted": fids})
+            self.progress.setVisible(True)
+        self._save_session()
 
     def _after_fresh_rows(self, then):
         """Read the table again right before writing, so filled cells are never overwritten by accident. It is
@@ -1342,6 +1415,17 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "dialogue":
+            self._dialogue_pending.discard(fid)
+            it = self.items.get(fid)
+            if it and it.get("result"):
+                it["result"]["dialogue"] = res["dialogue"]
+                self._refresh_row(fid)
+                if fid == self.current:
+                    self._show_details(fid)
+                self._save_session()
+            self._maybe_idle()
+            return
         if kind == "rows":
             self.sheet_rows = {r["row"]: r for r in res["rows"]}
             then, self._rows_then = self._rows_then, None
@@ -1364,12 +1448,15 @@ class MainWindow(QMainWindow):
                 self._remember_written(u)
             self.status_text.setText(f"Строка {ups[0]['row']}: таймкоды записаны в таблицу." if len(ups) == 1
                                      else f"Дописано в таблицу строк: {len(ups)}.")
+            for f in res.get("noted", []):  # files that do not fit: their reason is in the table now
+                if f in self.items:
+                    self.items[f]["noted"] = True
             for f in res.get("fids", []):  # cut earlier, written only now
                 if f in self.items and self.items[f].get("cut"):
                     self.items[f]["cut"]["sheet"] = "записано"
                     self.items[f]["status"] = self.items[f]["status"].replace("таблица: ошибка", "в таблице ✓")
                     self._refresh_row(f)
-            if res.get("fids"):
+            if res.get("fids") or res.get("noted"):
                 self._save_session()
             self._maybe_idle(keep_text=True)
             return
@@ -1399,6 +1486,13 @@ class MainWindow(QMainWindow):
 
     def on_failed(self, fid, kind, msg):
         log_event(f"ошибка ({kind}): {msg}")
+        if kind == "dialogue":  # a check in the background: the file keeps its analysis, no window for this
+            self._dialogue_pending.discard(fid)
+            if msg != "остановлено" and fid in self.items:
+                self.status_text.setText(f"{os.path.basename(self.items[fid]['path'])}: не удалось проверить, "
+                                         f"разговор ли это ({msg.splitlines()[0]})")
+            self._maybe_idle(keep_text=True)
+            return
         if kind == "rows":
             self._rows_then = None
             if msg != "остановлено":
@@ -1483,7 +1577,7 @@ class MainWindow(QMainWindow):
             if it["result"] and not st.startswith(("готово", "вырезано")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
-                         "row": it.get("row"), "row_how": it.get("row_how", "")})
+                         "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False)})
         data += self._missing
         path = self._session_file()
         try:  # json.dumps uses the fast C encoder (json.dump would not); replace = never a half-written file

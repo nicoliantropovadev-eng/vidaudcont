@@ -33,8 +33,8 @@ def select_links(rows, first, last, skip_filled=True, skip_rows=()):
     for r in sorted(rows, key=lambda r: r["row"]):
         if not first <= r["row"] <= last or r["row"] in skip_rows:
             continue
-        if skip_filled and (r.get("cuts") or "").strip():
-            continue
+        if skip_filled and ((r.get("cuts") or "").strip() or (r.get("note") or "").strip()):
+            continue  # done, or marked as not fitting / not downloadable
         if r["id"] in seen:
             continue
         seen.add(r["id"])

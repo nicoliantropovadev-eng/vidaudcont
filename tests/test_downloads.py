@@ -19,6 +19,8 @@ def test_select_links():
     assert [r for r, _ in select_links(ROWS, 1, 1000, skip_filled=False)] == [5, 80, 81, 83]
     assert [r for r, _ in select_links(ROWS, 81, 82)] == [81, 82]
     assert [r for r, _ in select_links(ROWS, 1, 1000, skip_rows={81})] == [80, 83]
+    marked = ROWS + [{"row": 84, "id": "ZZZZZZZZZZZ", "cuts": "", "note": "НЕ РАЗГОВОР"}]
+    assert 84 not in [r for r, _ in select_links(marked, 1, 1000)]      # reason already in column E
 
 
 def test_write_links(tmp_path):

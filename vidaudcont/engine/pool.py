@@ -48,7 +48,7 @@ def plan(threads, ram_gb=None):
 
 def _worker_main(conn, threads):
     """The analysis process: loads the models once, then analyses the files sent through `conn`."""
-    from .analyzer import Models, Settings, analyze
+    from .analyzer import Models, Settings, analyze, dialogue_structure, load_audio
     models = Models(threads=threads)
     while True:
         try:
@@ -58,16 +58,20 @@ def _worker_main(conn, threads):
         if job is None:
             return
         try:
-            res = analyze(job["path"], models, Settings(**job["settings"]),
-                          progress=lambda f, t: conn.send(("progress", float(f), t)))
+            if job.get("kind") == "dialogue":  # only the conversation check, for files analysed before it existed
+                res = {"dialogue": dialogue_structure(models, load_audio(job["path"], 16000), job["segments"])}
+            else:
+                res = analyze(job["path"], models, Settings(**job["settings"]),
+                              progress=lambda f, t: conn.send(("progress", float(f), t)))
             conn.send(("done", res))
         except Exception as e:  # reported for this file; the process takes the next one
             conn.send(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
 
 
 class AnalysisPool:
-    """A queue of analyses served by up to `workers` processes. The callbacks are called from the
-    pool's threads: on_progress(fid, fraction, text), on_done(fid, result), on_failed(fid, message)."""
+    """A queue of analyses served by up to `workers` processes. The callbacks are called from the pool's
+    threads: on_progress(fid, fraction, text), on_done(fid, kind, result), on_failed(fid, kind, message).
+    kind is "analyze" (the whole analysis) or "dialogue" (only the conversation check)."""
 
     def __init__(self, on_progress, on_done, on_failed):
         self.on_progress, self.on_done, self.on_failed = on_progress, on_done, on_failed
@@ -95,11 +99,11 @@ class AnalysisPool:
                 slot.start()
         return n, each
 
-    def add(self, fid, path, settings):
+    def add(self, fid, path, settings, kind="analyze", extra=None):
         with self.lock:
             self.pending += 1
             gen = self.generation
-        self.jobs.put((fid, path, dict(settings), gen))
+        self.jobs.put((fid, path, dict(settings), gen, kind, dict(extra or {})))
 
     def cancel_all(self):
         """Drop the queue (returns the dropped ids) and stop the running analyses: they report "остановлено"."""
@@ -142,24 +146,24 @@ class _Slot(threading.Thread):
                 threading.Event().wait(0.5)
                 continue
             try:
-                fid, path, settings, gen = pool.jobs.get(timeout=0.5)
+                fid, path, settings, gen, kind, extra = pool.jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             self.busy = True
             try:
                 if gen != pool.generation:  # taken from the queue just as it was stopped
-                    pool.on_failed(fid, "остановлено")
+                    pool.on_failed(fid, kind, "остановлено")
                 else:
-                    self._analyse(fid, path, settings, gen)
+                    self._analyse(fid, path, settings, gen, kind, extra)
             except Exception:  # never lose the slot: report and go on
-                pool.on_failed(fid, traceback.format_exc(limit=3))
+                pool.on_failed(fid, kind, traceback.format_exc(limit=3))
             finally:
                 self.busy = False
                 with pool.lock:
                     pool.pending -= 1
         self._close()
 
-    def _analyse(self, fid, path, settings, gen):
+    def _analyse(self, fid, path, settings, gen, kind, extra):
         pool = self.pool
         threads = pool.threads
         if self.proc is None or not self.proc.is_alive() or self.proc_threads != threads:
@@ -171,25 +175,25 @@ class _Slot(threading.Thread):
             child.close()
             self.conn, self.proc_threads = parent, threads
         if gen != pool.generation:
-            pool.on_failed(fid, "остановлено")
+            pool.on_failed(fid, kind, "остановлено")
             return
         try:
-            self.conn.send({"path": path, "settings": dict(settings, threads=threads)})
+            self.conn.send(dict(extra, path=path, kind=kind, settings=dict(settings, threads=threads)))
             while True:
-                kind, *rest = self.conn.recv()
-                if kind == "progress":
+                what, *rest = self.conn.recv()
+                if what == "progress":
                     pool.on_progress(fid, *rest)
-                elif kind == "done":
-                    pool.on_done(fid, rest[0])
+                elif what == "done":
+                    pool.on_done(fid, kind, rest[0])
                     return
                 else:
-                    pool.on_failed(fid, rest[0])
+                    pool.on_failed(fid, kind, rest[0])
                     return
         except (EOFError, OSError):  # the process is gone: stopped by us, or it crashed
             self.proc.join(5)
             code = self.proc.exitcode
             self._close()
-            pool.on_failed(fid, "остановлено" if gen != pool.generation else
+            pool.on_failed(fid, kind, "остановлено" if gen != pool.generation else
                            f"анализ прервался: процесс анализа завершился аварийно (код {code}). "
                            "Попробуйте проанализировать этот файл ещё раз.")
 

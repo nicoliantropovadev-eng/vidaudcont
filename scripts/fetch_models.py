@@ -6,6 +6,7 @@ import urllib.request
 
 HF = "https://huggingface.co/{repo}/resolve/{rev}/{name}"
 ACCENT = ("Jzuluaga/accent-id-commonaccent_ecapa", "14bebf44b7e7a34204d0acc2c897935945fb5c51")
+SPEAKER = ("speechbrain/spkrec-xvect-voxceleb", "56895a2df401be4150a159f3a1c653f00051d477")
 WHISPER = ("Systran/faster-whisper-base.en", "3d3d5dee26484f91867d81cb899cfcf72b96be6c")
 FILES = [
     ("efficientat/mn10_as_mAP_471.pt",
@@ -17,6 +18,8 @@ FILES = [
      "146a2c6cb236e387b24972797ed9aebb3b54b09b33a072bee87eb3576bd88c01"),
     ("accent-ecapa/accent_encoder.txt", HF.format(repo=ACCENT[0], rev=ACCENT[1], name="accent_encoder.txt"),
      "a74ac219335687eba66ba1a389a6e48cd83897c7efd4692f5fd36c3e04f4ef6c"),
+    ("speaker-xvect/embedding_model.ckpt", HF.format(repo=SPEAKER[0], rev=SPEAKER[1], name="embedding_model.ckpt"),
+     "9d96cafa0ede1a84799b67dc9b5645f31f5b7d094e7e4775e5d5c12547883a93"),
     ("whisper-base.en/model.bin", HF.format(repo=WHISPER[0], rev=WHISPER[1], name="model.bin"),
      "2a166925539a16005f14ff328359f9b9adb9dc4fb631bb3b227526862e93e2ef"),
     ("whisper-base.en/config.json", HF.format(repo=WHISPER[0], rev=WHISPER[1], name="config.json"),

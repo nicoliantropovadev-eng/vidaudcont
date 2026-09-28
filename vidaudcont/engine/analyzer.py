@@ -54,9 +54,13 @@ class Settings:
     merge_gap: float = 1.0      # cuts closer than this are merged
     accent: bool = True
     topic: bool = True
+    dialogue: bool = True       # tell a conversation (two voices taking turns) from a lecture or a voice-over
+    only_suitable: bool = True  # "Cut all" cuts only medical conversations with a British accent
     threads: int = 0            # processor threads for analysis (0 = half of the logical cores)
 
 
+ACCENT_NOTE = {"американский": "АМЕРИКАНСКИЙ АКЦЕНТ", "ирландский": "ИРЛАНДСКИЙ АКЦЕНТ",
+               "австралийский": "АВСТРАЛИЙСКИЙ АКЦЕНТ", "индийский": "ИНДИЙСКИЙ АКЦЕНТ", "другой": "НЕ БРИТАНСКИЙ АКЦЕНТ"}
 ACCENT_GROUP = {"england": "британский", "scotland": "британский", "wales": "британский",
                 "ireland": "ирландский", "us": "американский", "canada": "американский",
                 "australia": "австралийский", "newzealand": "австралийский", "indian": "индийский"}
@@ -184,7 +188,7 @@ class Models:
         self.threads = threads or default_threads()
         torch.set_num_threads(self.threads)
         self._lock = threading.Lock()
-        self._vad = self._tagger = self._accent = self._asr = None
+        self._vad = self._tagger = self._accent = self._asr = self._speaker = None
         # On Intel Macs torch (LLVM OpenMP) and CTranslate2 (Intel OpenMP) cannot share a process:
         # the transcription runs in a separate process of this same program there.
         self.asr_in_subprocess = ((sys.platform == "darwin" and platform.machine() == "x86_64")
@@ -251,6 +255,43 @@ class Models:
                             labels[int(idx)] = name.strip().strip("'")
                 self._accent = (feats.eval(), norm.eval(), emb.eval(), clf.eval(), [labels[i] for i in range(len(labels))])
             return self._accent
+
+    def speaker(self):
+        """x-vector speaker embeddings (SpeechBrain, VoxCeleb). Tells voices apart well enough to see two
+        people taking turns, at a fraction of the cost of ECAPA (10 s instead of 3 min per recording)."""
+        with self._lock:
+            if self._speaker is None:
+                import torch
+                _torch_amp_compat(torch)
+                from speechbrain.lobes.features import Fbank
+                from speechbrain.lobes.models.Xvector import Xvector
+                from speechbrain.processing.features import InputNormalization
+                emb = Xvector(in_channels=24, activation=torch.nn.LeakyReLU, tdnn_blocks=5,
+                              tdnn_channels=[512, 512, 512, 512, 1500], tdnn_kernel_sizes=[5, 3, 3, 1, 1],
+                              tdnn_dilations=[1, 2, 3, 1, 1], lin_neurons=512)
+                emb.load_state_dict(_load_state(torch, os.path.join(self.dir, "speaker-xvect", "embedding_model.ckpt")))
+                self._speaker = (Fbank(n_mels=24).eval(), InputNormalization(norm_type="sentence", std_norm=False).eval(),
+                                 emb.eval())
+            return self._speaker
+
+    def speaker_embeddings(self, wav16, wins, batch=64):
+        """One 512-d embedding per (start, end) piece of speech (at most 1.5 s)."""
+        import torch
+        feats, norm, emb = self.speaker()
+        n = int(SPEAKER_WIN * 16000)
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(wins), batch):
+                chunk = wins[i:i + batch]
+                x = np.zeros((len(chunk), n), np.float32)
+                lens = np.zeros(len(chunk), np.float32)
+                for j, (s, e) in enumerate(chunk):
+                    a = wav16[int(s * 16000): int(s * 16000) + min(n, int((e - s) * 16000))]
+                    x[j, :len(a)] = a
+                    lens[j] = max(len(a), 1) / n
+                xt, lt = torch.from_numpy(x), torch.from_numpy(lens)
+                out.append(emb(norm(feats(xt), lt), lt).squeeze(1).numpy())
+        return np.concatenate(out)
 
     def asr(self):
         with self._lock:
@@ -536,6 +577,75 @@ def transcribe_excerpts(models, wav16, dur, segs, n_excerpts=4, excerpt=45.0):
     return "\n".join(f"[{fmt_time(s)}] {t}" for s, t in zip(starts, texts))
 
 
+# ---------------------------------------------------------------- conversation or not
+SPEAKER_WIN = 1.5           # pieces of speech of this length get a speaker embedding each
+DIALOGUE_SEPARATION = 0.15  # two groups of voices at least this far apart (silhouette) = two people ...
+DIALOGUE_MINOR = 0.15       # ... the second one speaking at least this share of the time ...
+DIALOGUE_TURNS = 1.8        # ... and taking turns at least this often per minute of speech
+
+
+def speaker_windows(segs, min_len=0.8):
+    """Speech cut into 1.5-s pieces; a short reply ("Yes", "Same") is a piece of its own."""
+    out = []
+    for s, e in segs:
+        if e - s < min_len:
+            continue
+        t, first = s, len(out)
+        while t + SPEAKER_WIN <= e + 0.25:
+            out.append((t, min(t + SPEAKER_WIN, e)))
+            t += SPEAKER_WIN
+        if len(out) == first:
+            out.append((s, e))
+    return out
+
+
+def dialogue_structure(models, wav16, segs):
+    """Two people taking turns? The pieces of speech are split into two groups by voice. A conversation has
+    two distinct voices, each with a fair share, alternating through the recording. A lecture, a voice-over or
+    an examination commented by one person has one voice, or two voices in long blocks (narrator, then scene)."""
+    from scipy.cluster.hierarchy import fcluster, linkage
+    wins = speaker_windows(segs)
+    if len(wins) < 20:
+        return {"pieces": len(wins), "conversation": None, "reason": "слишком мало речи, чтобы судить"}
+    if len(wins) > 1500:  # hours of speech: every n-th piece is plenty and keeps memory in check
+        wins = wins[::len(wins) // 1500 + 1]
+    E = models.speaker_embeddings(wav16, wins)
+    E = E - E.mean(axis=0)  # what every piece shares (room, microphone) says nothing about who is speaking
+    E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
+    lab = fcluster(linkage(E, method="ward"), t=2, criterion="maxclust")
+    S = E @ E.T
+    same = lab[:, None] == lab[None, :]
+    inside = np.where(same, S, 0).sum(1) / np.maximum(same.sum(1), 1)
+    across = np.where(~same, S, 0).sum(1) / np.maximum((~same).sum(1), 1)
+    separation = float(np.mean(inside - across))
+    minor = float(min(np.mean(lab == 1), np.mean(lab == 2)))
+    smooth = [np.bincount(lab[max(0, i - 2): i + 3]).argmax() for i in range(len(lab))]
+    turns = sum(1 for x, y in zip(smooth, smooth[1:]) if x != y)
+    per_min = turns / max(sum(e - s for s, e in wins) / 60, 1e-6)
+    two = separation >= DIALOGUE_SEPARATION and minor >= DIALOGUE_MINOR
+    conversation = two and per_min >= DIALOGUE_TURNS
+    reason = "" if conversation else ("говорит в основном один человек" if not two
+                                      else "голоса звучат длинными блоками, а не чередуются")
+    return {"pieces": len(wins), "separation": round(separation, 3), "minor_share": round(minor, 2),
+            "turns_per_min": round(per_min, 1), "conversation": bool(conversation), "reason": reason}
+
+
+def suitability(res):
+    """Why a recording is not a medical conversation with a British accent; [] = it is one.
+    None when the conversation check has not been done for it yet."""
+    d, t, a = res.get("dialogue"), res.get("topic"), res.get("accent")
+    if d is None:
+        return None
+    why = []
+    if d.get("conversation") is False:
+        why.append("НЕ РАЗГОВОР")
+    if t and t.get("medical") is False:
+        why.append("НЕ МЕДИЦИНСКАЯ ТЕМА")
+    if a and a.get("top") and a["top"] != "британский":
+        why.append(ACCENT_NOTE.get(a["top"], "НЕ БРИТАНСКИЙ АКЦЕНТ"))
+    return why
+
+
 def analyze(path, models, settings=None, progress=None, cancelled=None):
     """Analyse one audio/video file. progress(fraction, text) is called along the way."""
     st = settings or Settings()
@@ -563,6 +673,10 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
     if st.accent:
         step(0.62, "определение акцента")
         accent = accent_vote(models, wav16, speech_chunks(segs, music_sec, st))
+    dialogue = None
+    if st.dialogue:
+        step(0.7, "разговор или лекция")
+        dialogue = dialogue_structure(models, wav16, segs)
     transcript, topic = "", None
     if st.topic:
         step(0.8, "расшифровка фрагментов для темы")
@@ -581,6 +695,7 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
         "topic": topic,
         "transcript": transcript,
         "phase": phase,
+        "dialogue": dialogue,
         "segments": segs,
         "music_per_second": [round(float(x), 3) for x in music_sec],
         "settings": asdict(st),

@@ -16,7 +16,8 @@ datas += collect_data_files("speechbrain", include_py_files=True)  # lazily impo
 binaries = [(os.path.join("bin", f), "bin") for f in os.listdir("bin")]
 binaries += collect_dynamic_libs("ctranslate2")
 # only the speechbrain parts the accent model is built from (the rest needs optional packages)
-hiddenimports = ["speechbrain.lobes.features", "speechbrain.lobes.models.ECAPA_TDNN",
+hiddenimports = ["speechbrain.lobes.features", "speechbrain.lobes.models.ECAPA_TDNN", "speechbrain.lobes.models.Xvector",
+                 "scipy.cluster.hierarchy",
                  "speechbrain.processing.features", "speechbrain.nnet.CNN", "speechbrain.nnet.linear",
                  "speechbrain.nnet.normalization", "speechbrain.nnet.pooling"]
 

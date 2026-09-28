@@ -98,6 +98,8 @@ def selftest(out_json=None, gui=False):
             check(f"речь {a}-{b} с сохранена", cover(a, b) <= 0.2, f"вырезано {cover(a, b):.0%}")
         check("акцент британский", r["accent"] and r["accent"]["top"] == "британский", r["accent"] and r["accent"]["groups"])
         check("расшифровка для темы", bool(r["transcript"].strip()), r["transcript"][:80])
+        d = r.get("dialogue") or {}
+        check("проверка «разговор или нет»", "separation" in d, d)
 
         from dataclasses import asdict
 
@@ -106,7 +108,7 @@ def selftest(out_json=None, gui=False):
         got, failed, finished = {}, {}, threading.Event()
 
         def keep(store):
-            def f(fid, value):
+            def f(fid, kind, value):
                 store[fid] = value
                 if len(got) + len(failed) == 2:
                     finished.set()
@@ -202,11 +204,13 @@ def main(argv=None):
     if a.selftest or a.selftest_gui:
         return selftest(a.json, gui=a.selftest_gui)
     if a.analyze:
-        from .engine.analyzer import Models, analyze
+        from .engine.analyzer import Models, analyze, suitability
         models, out = Models(), []
         for f in a.files:
             r = analyze(f, models)
-            print(f"{os.path.basename(f)}\t{r['timecodes']}", flush=True)
+            why = suitability(r)
+            print(f"{os.path.basename(f)}\t{r['timecodes']}\t{'подходит' if not why else ' + '.join(why or [])}",
+                  flush=True)
             out.append(r)
         if a.json:
             with open(a.json, "w", encoding="utf-8") as fh:

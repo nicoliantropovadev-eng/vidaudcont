@@ -34,12 +34,12 @@ class Collector:
             self.progress.add(fid)
             self.cond.notify_all()
 
-    def on_done(self, fid, res):
+    def on_done(self, fid, kind, res):
         with self.cond:
             self.done[fid] = res
             self.cond.notify_all()
 
-    def on_failed(self, fid, msg):
+    def on_failed(self, fid, kind, msg):
         with self.cond:
             self.failed[fid] = msg
             self.cond.notify_all()

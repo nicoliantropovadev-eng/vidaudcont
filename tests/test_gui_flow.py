@@ -94,6 +94,7 @@ def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
         for n in names:
             shutil.copy(resources.asset("selftest.m4a"), src_dir / n)
         w = MainWindow()
+        w.settings.only_suitable = False  # the self-test clip is read speech, not a conversation
         w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True, "overwrite": False}
         w.add_paths([str(src_dir)])  # adding files starts the row search
         wait(app, lambda: all(it.get("row") for it in w.items.values()))
@@ -127,7 +128,9 @@ def test_sheet_rows_cut_all_and_write_back(tmp_path, monkeypatch):
         assert sheet.cell(8, 4) == "start-0:05"              # hand-made value kept (overwrite is off)
         assert sheet.cell(8, 5) == "моя пометка"
         assert sheet.cell(9, 4) == "good"
-        assert sheet.cell(7, 5) == ""                        # British accent: no note
+        from vidaudcont.engine.analyzer import suitability
+        res7 = next(it for it in w.items.values() if it.get("row") == 7)["result"]
+        assert sheet.cell(7, 5) == " + ".join(suitability(res7))  # why it does not fit, if it does not
         assert os.path.getsize(out / "9.m4a") == os.path.getsize(src_dir / "Клинический разговор три.m4a")
         w.close()
     finally:
@@ -277,3 +280,58 @@ def test_file_list_survives_a_restart_and_bad_files(tmp_path, monkeypatch):
     broken = [n for n in os.listdir(os.path.dirname(session)) if ".broken-" in n]
     assert broken                                        # the damaged list is kept aside for recovery
     w4.close()
+
+
+def test_cut_all_cuts_only_medical_conversations_with_british_accent(tmp_path, monkeypatch):
+    """A lecture (one voice) and an American conversation are not cut: their reason goes to column E.
+    A file analysed before the conversation check gets only that check."""
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    asked, told = [], []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    grid = [["", "", "Link", "", ""]] + [["", "", f"https://youtu.be/{c * 11}", "", ""] for c in "ABC"]
+    sheet = MockSheet(grid, key="k")
+    try:
+        from vidaudcont.gui.main_window import MainWindow
+        base = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [[5.0, 30.0]], "hints": [],
+                "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "speech_db": -20.0,
+                "topic": {"medical": True, "top_terms": ["pain"]}}
+        british = {"top": "британский", "groups": {"британский": 1.0}}
+        talk = {"conversation": True, "separation": 0.3, "minor_share": 0.4, "turns_per_min": 4.0, "reason": ""}
+        lecture = {"conversation": False, "separation": 0.07, "minor_share": 0.3, "turns_per_min": 6.0,
+                   "reason": "говорит в основном один человек"}
+        files = {"разговор.m4a": (2, dict(base, accent=british, dialogue=talk)),
+                 "лекция.m4a": (3, dict(base, accent=british, dialogue=lecture)),
+                 "американцы.m4a": (4, dict(base, accent={"top": "американский", "groups": {"американский": 1.0}},
+                                            dialogue=talk))}
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True}
+        for name, (row, res) in files.items():
+            shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
+            fid = w._add_item(str(tmp_path / name), {"status": "готово", "result": res, "row": row, "row_how": "вручную"})
+        w.table.selectRow(0)
+        assert [w.table.item(r, 7).text() for r in range(3)] == ["✓ да", "✗ не разговор", "✗ американский акцент"]
+        w.cut_all()
+        wait(app, lambda: w.worker.pending == 0 and w.net.pending == 0 and w.pool.pending == 0
+             and all(it.get("cut") or it.get("noted") for it in w.items.values()), timeout=300)
+        assert "Не подходят (2)" in asked[0]
+        assert os.listdir(tmp_path / "готово") == ["2.m4a"]
+        assert sheet.cell(2, 4) == "start-0:05" and sheet.cell(2, 5) == ""
+        assert sheet.cell(3, 5) == "НЕ РАЗГОВОР" and sheet.cell(4, 5) == "АМЕРИКАНСКИЙ АКЦЕНТ"
+        asked.clear()
+        w.cut_all()                      # nothing left: the reasons are not written again
+        assert not asked and told
+
+        old = str(tmp_path / "старый анализ.m4a")    # analysed by an older version: only the new check runs
+        shutil.copy(resources.asset("selftest.m4a"), old)
+        res = dict(base, accent=british, segments=[[5.0, 30.0], [40.0, 55.0], [60.0, 72.0]])
+        fid = w._add_item(old, {"status": "готово", "result": res})
+        w._check_dialogues()
+        wait(app, lambda: "dialogue" in w.items[fid]["result"], timeout=300)
+        assert "separation" in w.items[fid]["result"]["dialogue"]
+        w.close()
+    finally:
+        sheet.close()
