@@ -541,13 +541,15 @@ def accent_vote(models, wav16, chunks, max_chunks=80):
             "top": groups.most_common(1)[0][0], "non_british": other}
 
 
-def transcribe(model, clips):
+def transcribe(model, clips, progress=None):
     """Whisper text of each clip (16 kHz float32 arrays)."""
     out = []
-    for clip in clips:
+    for i, clip in enumerate(clips):
         seg_iter, _ = model.transcribe(clip, language="en", beam_size=1, vad_filter=False,
                                        condition_on_previous_text=False)
         out.append(" ".join(x.text.strip() for x in seg_iter))
+        if progress:
+            progress((i + 1) / len(clips))
     return out
 
 
@@ -591,13 +593,14 @@ def speech_chunks_for_asr(segs, max_len=28.0, join_gap=1.5):
     return [(a, b) for a, b in out if b - a >= 0.3]
 
 
-def transcribe_full(models, wav16, segs, paragraph_gap=3.0):
+def transcribe_full(models, wav16, segs, paragraph_gap=3.0, progress=None):
     """The whole recording as text: every stretch of speech, a new paragraph after a longer pause."""
     chunks = speech_chunks_for_asr(segs)
     if not chunks:
         return ""
     clips = [np.ascontiguousarray(wav16[int(a * 16000):int(b * 16000)], dtype=np.float32) for a, b in chunks]
-    texts = _transcribe_in_subprocess(models, clips) if models.asr_in_subprocess else transcribe(models.asr(), clips)
+    texts = (_transcribe_in_subprocess(models, clips) if models.asr_in_subprocess
+             else transcribe(models.asr(), clips, progress))
     out, prev_end = [], None
     for (a, b), t in zip(chunks, texts):
         t = t.strip()

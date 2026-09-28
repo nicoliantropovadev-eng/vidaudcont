@@ -487,6 +487,7 @@ def test_every_video_is_transcribed_into_its_own_sheet(tmp_path, monkeypatch):
         assert sheet.cell(3, 1, "Расшифровки").endswith("BBBBBBBBBB2") and sheet.cell(3, 2, "Расшифровки")
         assert w.items[fids[2]].get("full_text") is None
         assert w.table.item(w._row_of(fids[0]), C_TEXT).text() == "✓ в таблице"
+        assert w.items[fids[0]]["status"] == "готово"          # the transcription does not take over the status
         assert sheet.cell(2, 4) == ""                                     # the main sheet is left alone
         from vidaudcont.gui import main_window
         monkeypatch.setattr(main_window, "CELL_MAX", 40)                  # a long text goes on in C, D, …
@@ -629,6 +630,7 @@ def test_transcription_of_chosen_rows(tmp_path, monkeypatch):
         assert set(items) == {"Talk three.m4a", "Talk one.m4a"}
         assert all(it.get("text_only") and it["status"] == "только расшифровка" for it in items.values())
         wait(app, lambda: all(it.get("full_text") is not None for it in items.values()), timeout=300)
+        assert all(it["status"] == "расшифровано" for it in items.values())
         assert all(it["result"] is None for it in items.values())            # nothing analysed
         w._flush_texts()
         wait(app, lambda: all(it.get("text_written") for it in items.values()) and w.net.pending == 0, timeout=60)
@@ -638,3 +640,30 @@ def test_transcription_of_chosen_rows(tmp_path, monkeypatch):
         w.close()
     finally:
         sheet.close()
+
+
+def test_statuses_left_by_a_transcription_are_put_right(tmp_path):
+    """Version 1.6.0 left "расшифровка 5%" over "вырезано ✓"/"готово": restoring the list repairs it, and a cut file
+    is not cut again by «Вырезать все»."""
+    import json
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    from vidaudcont.gui.main_window import MainWindow
+    res = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "good", "segments": [], "hints": [], "cuts": [],
+           "transcript": "", "accent": None, "topic": None}
+    files = []
+    for n in ("вырезан.m4a", "готов.m4a", "только текст.m4a"):
+        shutil.copy(resources.asset("selftest.m4a"), tmp_path / n)
+        files.append(str(tmp_path / n))
+    w = MainWindow()
+    session = w._session_file()
+    w.close()
+    json.dump([{"path": files[0], "status": "расшифровка 5%", "result": res, "text": None, "row": 7,
+                "cut": {"output": str(tmp_path / "7.m4a"), "verification": {"lossless": True}, "sheet": "записано"}},
+               {"path": files[1], "status": "расшифровка 5%", "result": res, "text": None, "cut": None, "row": 8},
+               {"path": files[2], "status": "расшифровка 5%", "result": None, "text": None, "cut": None, "row": 9,
+                "text_only": True, "full_text": "Hello."}], open(session, "w", encoding="utf-8"), ensure_ascii=False)
+    w = MainWindow()
+    by = {os.path.basename(it["path"]): it["status"] for it in w.items.values()}
+    assert by == {"вырезан.m4a": "вырезано ✓, в таблице ✓", "готов.m4a": "готово", "только текст.m4a": "расшифровано"}
+    w.close()

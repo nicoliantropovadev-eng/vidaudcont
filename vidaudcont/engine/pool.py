@@ -62,10 +62,12 @@ def _worker_main(conn, threads):
             if job.get("kind") == "dialogue":  # only the conversation check, for files analysed before it existed
                 res = {"dialogue": dialogue_structure(models, load_audio(job["path"], 16000), job["segments"])}
             elif job.get("kind") == "transcribe":  # the whole recording as text, for the table
-                conn.send(("progress", 0.05, "расшифровка"))
+                conn.send(("progress", 0.02, "расшифровка"))
                 wav = load_audio(job["path"], 16000)
                 segs = job.get("segments") or speech_segments(models, wav)
-                res = {"text": transcribe_full(models, wav, segs)}
+                conn.send(("progress", 0.08, "расшифровка"))
+                res = {"text": transcribe_full(models, wav, segs,
+                                               progress=lambda f: conn.send(("progress", 0.08 + 0.92 * f, "расшифровка")))}
             else:
                 res = analyze(job["path"], models, Settings(**job["settings"]),
                               progress=lambda f, t: conn.send(("progress", float(f), t)))

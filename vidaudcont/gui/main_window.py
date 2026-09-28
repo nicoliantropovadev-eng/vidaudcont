@@ -1169,8 +1169,10 @@ class MainWindow(QMainWindow):
             text_item.setText("✓ в таблице")
         elif it.get("full_text") is not None:
             text_item.setText("готов")
+        elif fid in self._text_pending:
+            text_item.setText(f"{it['text_progress']:.0%}" if it.get("text_progress") else "в очереди")
         else:
-            text_item.setText("…" if fid in self._text_pending else "")
+            text_item.setText("")
         text_item.setToolTip((it.get("full_text") or "")[:1500])
         cut = it.get("cut")
         cut_item = self.table.item(r, C_CUT)
@@ -1849,7 +1851,9 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             it = self.items[fid]
-            if not it["result"] or (it.get("cut") and it["status"].startswith("вырезано")):
+            if not it["result"] or (it.get("cut") and (it["status"].startswith("вырезано") or
+                                                       self._proper_status(it).startswith("вырезано") and
+                                                       it["text"] is None)):
                 continue
             if it.get("skip"):
                 skipped.append(os.path.basename(it["path"]))
@@ -2064,7 +2068,10 @@ class MainWindow(QMainWindow):
             self.progress.setValue(int(frac * 100))
             self.status_text.setText(text)
             return
-        it["status"] = f"{text} {frac:.0%}"
+        if text == "расшифровка" and fid in self._text_pending:  # the file keeps its status: analysed, cut…
+            it["text_progress"] = frac
+        else:
+            it["status"] = f"{text} {frac:.0%}"
         self._refresh_row(fid)
         self.progress.setVisible(True)
         self.progress.setValue(int(frac * 100))
@@ -2090,6 +2097,9 @@ class MainWindow(QMainWindow):
             it = self.items.get(fid)
             if it:
                 it["full_text"], it["text_written"] = res["text"], False
+                it.pop("text_progress", None)
+                if it.get("text_only") and it["result"] is None:
+                    it["status"] = "расшифровано"
                 self._refresh_row(fid)
                 if fid == self.current:
                     self._show_details(fid)
@@ -2108,7 +2118,9 @@ class MainWindow(QMainWindow):
                     self._refresh_row(f)
             self._texts_in_flight = set()
             self._save_session()
-            self.status_text.setText(f"Расшифровки записаны в таблицу: {len(res['fids'])}.")
+            done = sum(1 for it in self.items.values() if it.get("text_written"))
+            self.status_text.setText(f"Расшифровки на листе «{self.sheet_cfg.get('text_sheet', '')}»: записано ещё "
+                                     f"{len(res['fids'])}, всего из этого списка {done}.")
             self._flush_texts()  # the next batch, if any
             self._maybe_idle(keep_text=True)
             return
@@ -2198,6 +2210,8 @@ class MainWindow(QMainWindow):
             return
         if kind in ("transcribe", "texts"):  # no window: the file keeps its analysis, the text comes later
             self._text_pending.discard(fid)
+            if fid in self.items:
+                self.items[fid].pop("text_progress", None)
             if kind == "texts":
                 self._texts_in_flight = set()
                 self.text_timer.start(60000)
@@ -2332,11 +2346,31 @@ class MainWindow(QMainWindow):
         if not self.save_timer.isActive():
             self.save_timer.start()
 
+    @staticmethod
+    def _proper_status(it):
+        """The status a file should show from what is known about it (repairs one left by a transcription)."""
+        cut = it.get("cut")
+        if cut:
+            ok = (cut.get("verification") or {}).get("lossless")
+            st = "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
+            if cut.get("sheet") == "записано":
+                st += ", в таблице ✓"
+            elif str(cut.get("sheet") or "").startswith("ошибка"):
+                st += ", таблица: ошибка"
+            return st
+        if it.get("result"):
+            return "не подходит" if it.get("noted") else "готово"
+        if it.get("text_only"):
+            return "расшифровано" if it.get("full_text") is not None else "только расшифровка"
+        return "ожидает анализа"
+
     def _write_session(self):
         self.save_timer.stop()
         data = []
         for r in range(self.table.rowCount()):
             it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
+            if it["status"].startswith("расшифровка"):
+                it["status"] = self._proper_status(it)
             st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
                 (it["status"] if it["status"] == "ошибка" or it["status"].startswith("пропущен") or it.get("text_only")
                  else "ожидает анализа")
@@ -2389,6 +2423,8 @@ class MainWindow(QMainWindow):
         for d in data:
             if not isinstance(d, dict) or not d.get("path") or best.get(norm_path(d["path"])) is not d:
                 continue
+            if str(d.get("status") or "").startswith("расшифровка"):  # left there by version 1.6.0
+                d["status"] = self._proper_status(d)
             if not os.path.exists(d["path"]):
                 self._missing.append(d)
                 continue
