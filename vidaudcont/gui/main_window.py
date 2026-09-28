@@ -789,6 +789,7 @@ class MainWindow(QMainWindow):
                             (info["link"] if info else "Двойной щелчок — указать номер строки вручную"))
         self.table.item(r, C_DUR).setText(fmt_time(res["duration"]) if res else "")
         self.table.item(r, C_STATUS).setText(it["status"])
+        self.table.item(r, C_STATUS).setToolTip(("Пропускается: " + it["skip"]) if it.get("skip") else "")
         tc = it["text"] if it["text"] is not None else res.get("timecodes", "")
         self.table.item(r, C_TC).setText(tc)
         self.table.item(r, C_TC).setToolTip(tc)
@@ -1159,7 +1160,7 @@ class MainWindow(QMainWindow):
             copy = bool(re.search(r" \(\d+\)$", os.path.splitext(os.path.basename(it["path"]))[0]))
             return not it.get("cut"), it.get("result") is None, copy, fid
 
-        kept, skipped = {}, 0
+        kept, skipped, twice = {}, 0, []
         for fid in sorted(self.items, key=rank):
             it = self.items[fid]
             info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
@@ -1168,7 +1169,11 @@ class MainWindow(QMainWindow):
                 if row_marked_red(info) or row_marked_red(self.sheet_rows.get(first.get(info["id"]), {})):
                     reason = "строка отмечена красным"
                 elif info["id"] in kept:
-                    reason = f"повтор файла {os.path.basename(self.items[kept[info['id']]]['path'])}"
+                    other = self.items[kept[info["id"]]]["path"]
+                    if norm_path(other) == norm_path(it["path"]):  # the very same file listed twice
+                        twice.append(fid)
+                        continue
+                    reason = f"повтор: это же видео (строка {info['row']}) — файл {os.path.basename(other)}"
                 else:
                     kept[info["id"]] = fid
             skipped += reason is not None
@@ -1178,17 +1183,26 @@ class MainWindow(QMainWindow):
                 it["skip"] = reason
                 if it["result"] is None:
                     self.pool.drop(fid)
-                    it["status"] = "пропущен"
+                    it["status"] = "пропущен: " + ("красная строка" if "красным" in reason else "повтор")
             else:
                 it.pop("skip", None)
                 self.pool.skip.discard(fid)
-                if it["result"] is None and it["status"] == "пропущен":
+                if it["result"] is None and it["status"].startswith("пропущен"):
                     it["status"] = "ожидает анализа"
                     if self.auto_analyze:
                         self._queue_analysis(fid)
             self._refresh_row(fid)
             if fid == self.current:
                 self._show_details(fid)
+        for fid in twice:  # keep one entry per file: the one that got further stays
+            self.pool.drop(fid)
+            self.items.pop(fid, None)
+            r = self._row_of(fid)
+            if r >= 0:
+                self.table.removeRow(r)
+        if twice:
+            log_event(f"убраны записи одного и того же файла: {len(twice)}")
+            self._save_session()
         return skipped
 
     def _pending_match_paths(self):
@@ -1680,12 +1694,14 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
             st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
-                (it["status"] if it["status"] in ("ошибка", "пропущен") else "ожидает анализа")
+                (it["status"] if it["status"] == "ошибка" or it["status"].startswith("пропущен") else "ожидает анализа")
             if it["result"] and not st.startswith(("готово", "вырезано")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
                          "skip": it.get("skip")})
+        present = {norm_path(it["path"]) for it in self.items.values()}
+        self._missing = [d for d in self._missing if norm_path(d.get("path", "")) not in present]  # it came back
         data += self._missing
         path = self._session_file()
         try:  # json.dumps uses the fast C encoder (json.dump would not); replace = never a half-written file
@@ -1716,14 +1732,22 @@ class MainWindow(QMainWindow):
                     pass
         if not isinstance(data, list):
             return
+        best = {}  # one entry per file: the one that got further (cut, then analysed)
         for d in data:
-            if not isinstance(d, dict):
+            if isinstance(d, dict) and d.get("path"):
+                key = norm_path(d["path"])
+                if key not in best or (bool(d.get("cut")), d.get("result") is not None) > \
+                        (bool(best[key].get("cut")), best[key].get("result") is not None):
+                    best[key] = d
+        for d in data:
+            if not isinstance(d, dict) or not d.get("path") or best.get(norm_path(d["path"])) is not d:
                 continue
-            if not os.path.exists(d.get("path", "")):
+            if not os.path.exists(d["path"]):
                 self._missing.append(d)
                 continue
-            if d.get("result") is None and d.get("status") not in ("ошибка", "пропущен"):  # waiting or analysing
-                d["status"] = "ожидает анализа"
+            status = d.get("status") or ""
+            if d.get("result") is None and status != "ошибка" and not status.startswith("пропущен"):
+                d["status"] = "ожидает анализа"  # it was waiting or being analysed
             self._add_item(d["path"], d)
         log_event(f"список файлов восстановлен: {len(self.items)}, нет на диске: {len(self._missing)}")
         if self._missing:

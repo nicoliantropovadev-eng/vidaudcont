@@ -1,7 +1,7 @@
 """VidAudCont: finds and losslessly cuts non-conversation parts of recordings."""
 import os
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 # torch and CTranslate2 each bundle Intel's OpenMP runtime (Windows, Intel Macs); loading the
 # second copy aborts the process unless this is set before either library is imported

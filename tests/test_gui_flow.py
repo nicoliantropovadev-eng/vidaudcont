@@ -373,6 +373,7 @@ def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
         assert [it[n].get("row") for n in fids] == [2, 2, 3]
         assert it["Разговор один.m4a"].get("skip") is None
         assert "повтор" in it["Разговор один (1).m4a"]["skip"] and "красным" in it["Разговор два.m4a"]["skip"]
+        assert "Разговор один.m4a" in it["Разговор один (1).m4a"]["skip"]     # says which file is used
         assert w.table.item(w._row_of(fids["Разговор два.m4a"]), C_FIT).text() == "✗ пропуск: красная строка"
         w.cut_all()
         wait(app, lambda: it["Разговор один.m4a"].get("cut") and w.worker.pending == 0 and w.net.pending == 0)
@@ -387,3 +388,34 @@ def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
         w.close()
     finally:
         sheet.close()
+
+
+def test_the_same_file_twice_in_the_list_becomes_one(tmp_path, monkeypatch):
+    """A file saved twice in the list (older versions could) is restored once, the analysed entry kept;
+    a saved entry for a missing file is dropped once the file is back in the list."""
+    import json
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    from vidaudcont.gui.main_window import MainWindow
+    f = tmp_path / "видео.m4a"
+    shutil.copy(resources.asset("selftest.m4a"), f)
+    res = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "good", "segments": [], "hints": [], "cuts": [],
+           "transcript": "", "accent": None, "topic": None}
+    w = MainWindow()
+    session = w._session_file()
+    w.close()
+    entries = [{"path": str(f), "status": "ожидает анализа", "result": None, "text": None, "cut": None, "row": 7},
+               {"path": str(tmp_path) + "/./" + f.name, "status": "готово", "result": res, "text": None, "cut": None,
+                "row": 7},
+               {"path": str(tmp_path / "позже.m4a"), "status": "готово", "result": res, "text": None, "cut": None}]
+    json.dump(entries, open(session, "w", encoding="utf-8"), ensure_ascii=False)
+    w = MainWindow()
+    assert len(w.items) == 1 and next(iter(w.items.values()))["result"]["timecodes"] == "good"
+    assert len(w._missing) == 1
+    shutil.copy(resources.asset("selftest.m4a"), tmp_path / "позже.m4a")    # the missing file comes back
+    w.add_paths([str(tmp_path / "позже.m4a")])
+    w._write_session()
+    saved = json.load(open(session, encoding="utf-8"))
+    assert sorted(os.path.basename(d["path"]) for d in saved) == ["видео.m4a", "позже.m4a"]
+    w.close()
