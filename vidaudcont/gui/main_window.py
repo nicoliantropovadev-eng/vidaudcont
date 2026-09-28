@@ -21,7 +21,8 @@ from .. import __version__, cutter
 from ..engine.analyzer import Settings, default_threads, suitability
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
-from ..downloads import FolderWatcher, clean_link, first_rows, norm_path, repeats, select_links, write_links
+from ..downloads import (FolderWatcher, clean_link, first_rows, norm_path, parse_rows, repeats, select_links,
+                         select_text_links, write_links)
 from .. import naming
 from ..matching import TitleCache, match_files
 from ..sheet import (SCRIPT_VERSION, SheetClient, SheetError, export_connection, import_connection, new_key,
@@ -136,6 +137,9 @@ class Worker(QThread):
                     res = {"folder": payload["folder"], "plan": naming.check_folder(
                         payload["folder"], rows, cache.data, payload["lang"], payload["sources"],
                         progress=lambda f, t: report(0.3 + 0.7 * f, t))}
+                elif kind == "text_rows":
+                    res = {"rows": SheetClient.from_config(payload["cfg"], retries=2,
+                                                           cancelled=self.cancel_flag.is_set).rows()}
                 elif kind == "texts":  # transcripts into their own sheet: A = link, B = text, same row numbers
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
                     res = {"fids": payload["fids"]}
@@ -515,11 +519,18 @@ class NameCheckDialog(QDialog):
             "таблице обе строки — старую и новую.")
 
 
+WATCH_ACTIONS = [("analyze", "анализировать и вырезать, как обычно (и расшифровать, если задан лист)"),
+                 ("text", "только расшифровать — без анализа, вырезания и таймкодов"),
+                 ("add", "только добавить в список")]
+
+
 class DownloaderDialog(QDialog):
     """Links for 4K Video Downloader+ and the folder the program watches for finished downloads."""
 
-    def __init__(self, rows, have_rows, watch_dir, watching, auto_analyze, parent=None, script_version=SCRIPT_VERSION):
+    def __init__(self, rows, have_rows, watch_dir, watching, watch_action, parent=None, script_version=SCRIPT_VERSION):
         super().__init__(parent)
+        if isinstance(watch_action, bool):  # older callers: analyse or not
+            watch_action = "analyze" if watch_action else "add"
         self.setWindowTitle("4K Video Downloader+")
         self.setMinimumWidth(660)
         self.rows, self.have_rows = rows, set(have_rows)
@@ -571,9 +582,11 @@ class DownloaderDialog(QDialog):
         self.watching = QCheckBox("следить за этой папкой: новые файлы сами добавляются в программу")
         self.watching.setChecked(watching)
         form.addRow(self.watching)
-        self.auto_analyze = QCheckBox("и сразу анализировать их")
-        self.auto_analyze.setChecked(auto_analyze)
-        form.addRow(self.auto_analyze)
+        self.action = QComboBox()
+        for key, label in WATCH_ACTIONS:
+            self.action.addItem(label, key)
+        self.action.setCurrentIndex([k for k, _ in WATCH_ACTIONS].index(watch_action))
+        form.addRow("Новые файлы из папки", self.action)
         buttons = QHBoxLayout()
         b_copy = QPushButton("Скопировать ссылки")
         b_copy.clicked.connect(self._copy)
@@ -631,7 +644,7 @@ class DownloaderDialog(QDialog):
             self.count.setText(f"{len(links)}  — сохранено в {os.path.basename(path)}")
 
     def values(self):
-        return self.watch_dir.text().strip(), self.watching.isChecked(), self.auto_analyze.isChecked()
+        return self.watch_dir.text().strip(), self.watching.isChecked(), self.action.currentData()
 
     def repeats_to_mark(self):
         """Updates for column E of repeated videos not marked yet (and not red, which the user already marked)."""
@@ -640,6 +653,142 @@ class DownloaderDialog(QDialog):
         by_row = {r["row"]: r for r in self.rows}
         return [{"row": r, "note": f"ПОВТОР строки {first}"} for r, first in sorted(repeats(self.rows).items())
                 if not (by_row[r].get("note") or "").strip() and not row_marked_red(by_row[r])]
+
+
+class TranscriptionDialog(QDialog):
+    """Transcripts of chosen rows: files already at hand are only transcribed; for the rest the dialog gives links
+    to download, and the files downloaded into its folder are only transcribed as well."""
+
+    def __init__(self, window, rows, text_done, have_ids, text_sheet, spec, folder, watching):
+        super().__init__(window)
+        self.window, self.rows, self.text_done, self.have_ids = window, rows, set(text_done), set(have_ids)
+        self.setWindowTitle("Расшифровка видео")
+        self.setMinimumSize(700, 560)
+        form = QFormLayout(self)
+        about = QLabel(f"Расшифровки пишутся на лист «{text_sheet}»: строка N — видео из строки N основного листа "
+                       "(A — ссылка, B — текст). Уже скачанные файлы программа только расшифрует — без анализа и "
+                       "вырезания. Для видео, файлов которых нет, здесь будут ссылки для скачивания.")
+        about.setWordWrap(True)
+        form.addRow(about)
+        self.spec = QLineEdit(spec)
+        self.spec.setPlaceholderText("например: 80-120, 150, 200-250   (пусто — все строки)")
+        self.spec.textChanged.connect(self._update)
+        form.addRow("Строки", self.spec)
+        self.skip_red = QCheckBox("пропустить строки, отмеченные красным")
+        self.skip_red.setChecked(True)
+        self.skip_red.toggled.connect(self._update)
+        form.addRow(self.skip_red)
+        found = QHBoxLayout()
+        b_add = QPushButton("Добавить папку с аудио…")
+        b_add.setToolTip("Папка с уже скачанными файлами (например, прежняя папка загрузок или «готово»): программа "
+                         "найдёт их строки и расшифрует их, а их видео не попадут в ссылки для скачивания")
+        b_add.clicked.connect(self._add_folder)
+        found.addWidget(b_add)
+        self.found = QLabel("")
+        found.addWidget(self.found, 1)
+        form.addRow(found)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        form.addRow(self.summary)
+        self.links_box = QPlainTextEdit()
+        self.links_box.setReadOnly(True)
+        self.links_box.setPlaceholderText("Здесь будут ссылки на видео, файлов которых нет")
+        form.addRow(self.links_box)
+        buttons = QHBoxLayout()
+        b_copy = QPushButton("Скопировать ссылки на недостающие")
+        b_copy.clicked.connect(self._copy)
+        b_save = QPushButton("Сохранить в файл…")
+        b_save.clicked.connect(self._save)
+        buttons.addWidget(b_copy)
+        buttons.addWidget(b_save)
+        buttons.addStretch(1)
+        form.addRow(buttons)
+        folder_row = QHBoxLayout()
+        self.folder = QLineEdit(folder)
+        self.folder.setPlaceholderText("папка, куда скачивать эти видео")
+        browse = QPushButton("…")
+        browse.clicked.connect(self._browse)
+        folder_row.addWidget(self.folder)
+        folder_row.addWidget(browse)
+        form.addRow("Скачивать в папку", folder_row)
+        self.watching = QCheckBox("следить за этой папкой и только расшифровывать новые файлы")
+        self.watching.setChecked(watching)
+        form.addRow(self.watching)
+        hint = QLabel("В 4K Video Downloader+ укажите в «Умном режиме» эту папку (Аудио, M4A), нажмите «Вставить "
+                      "ссылку» — скачанные файлы программа подхватит и расшифрует сама.")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self._update()
+
+    def wanted(self):
+        return parse_rows(self.spec.text())
+
+    def links(self, stats=None):
+        try:
+            wanted = self.wanted()
+        except ValueError:
+            return []
+        return select_text_links(self.rows, wanted, self.text_done, self.have_ids, self.skip_red.isChecked(), stats)
+
+    def set_have_ids(self, have_ids):
+        """Files added meanwhile: their videos need no download."""
+        self.have_ids = set(have_ids)
+        self._update()
+
+    def _update(self):
+        try:
+            self.wanted()
+        except ValueError as e:
+            self.summary.setText(f"<span style='color:#c62828'>{e}</span>")
+            self.links_box.setPlainText("")
+            return
+        stats = {}
+        links = self.links(stats)
+        self.summary.setText(
+            f"Видео в выбранных строках: {stats.get('videos', 0)}. Уже расшифровано: {stats.get('done', 0)}. "
+            f"Есть файлы, расшифруются: {stats.get('have', 0)}. "
+            + (f"Красных пропущено: {stats['red']}. " if stats.get("red") else "")
+            + f"<b>Не хватает файлов: {len(links)}</b>" + (" — ссылки ниже." if links else "."))
+        self.links_box.setPlainText("\n".join(f"{link}    (строка {row})" for row, link in links))
+
+    def _add_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка с уже скачанными файлами", self.folder.text())
+        if d:
+            n = self.window.add_text_files(d)
+            self.found.setText(f"добавлено файлов: {n} — ищу их строки…" if n else "новых файлов в этой папке нет")
+
+    def _copy(self):
+        clipboard().setText("\n".join(link for _, link in self.links()))
+        self.summary.setText(self.summary.text() + " Скопированы.")
+
+    def _save(self):
+        links = self.links()
+        if not links:
+            return
+        start = os.path.join(self.folder.text() or os.path.expanduser("~"), "ссылки_для_расшифровки.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Файл со ссылками", start, "Текст (*.txt)")
+        if path:
+            write_links(path, links)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка для скачиваемых видео", self.folder.text())
+        if d:
+            self.folder.setText(d)
+
+    def _accept(self):
+        try:
+            self.wanted()
+        except ValueError as e:
+            QMessageBox.warning(self, "Строки", str(e))
+            return
+        self.accept()
+
+    def values(self):
+        return self.spec.text().strip(), self.folder.text().strip(), self.watching.isChecked()
 
 
 COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Подходит", "Текст",
@@ -654,6 +803,14 @@ MATCH_EVERY = 20  # seconds between row searches started by themselves (new file
 
 class MainWindow(QMainWindow):
     watch_found = Signal(object)  # files the background look at the downloads folder found ready
+
+    @property
+    def auto_analyze(self):
+        return self.watch_action == "analyze"
+
+    @auto_analyze.setter
+    def auto_analyze(self, on):
+        self.watch_action = "analyze" if on else "add"
 
     def __init__(self):
         super().__init__()
@@ -678,7 +835,16 @@ class MainWindow(QMainWindow):
         self.match_timer.timeout.connect(lambda: self.find_rows(quiet=True))
         self.watch_dir = self.qs.value("watch_dir", "") or ""
         self.watching = self.qs.value("watching", "false") == "true"
-        self.auto_analyze = self.qs.value("auto_analyze", "true") == "true"
+        # new files from the downloads folder: "analyze" (the usual), "text" (transcribe only) or "add"
+        self.watch_action = self.qs.value("watch_action", "") or \
+            ("analyze" if self.qs.value("auto_analyze", "true") == "true" else "add")
+        self.text_done_rows = set()  # rows of the transcripts sheet that have a text, as last read
+        self.text_spec = self.qs.value("text_rows", "") or ""  # rows chosen for transcripts ("" = every row)
+        self.text_dir = self.qs.value("text_dir", "") or ""     # videos downloaded only for their transcripts
+        self.text_watching = self.qs.value("text_watching", "false") == "true"
+        self.text_watcher = FolderWatcher(self.text_dir)
+        self._text_rows_then = None
+        self._downloader_dialog = None
         self.watcher = FolderWatcher(self.watch_dir)
         self._scanning = False
         self.watch_found.connect(self._on_watch_found)
@@ -701,7 +867,7 @@ class MainWindow(QMainWindow):
         self.watch_timer = QTimer(self)
         self.watch_timer.setInterval(4000)
         self.watch_timer.timeout.connect(self._scan_watch)
-        if self.watching and self.watch_dir:
+        if self._watched():
             self.watch_timer.start()
 
         self.worker = Worker(self)  # cuts, one after another
@@ -749,6 +915,8 @@ class MainWindow(QMainWindow):
                                                       "и исправить несовпадающие")
         act("4K Video Downloader+…", self.open_downloader, "Ссылки из таблицы для загрузки и папка, за которой "
                                                            "следит программа")
+        act("Расшифровка видео…", self.open_transcription, "Только текст для выбранных строк: уже скачанные файлы "
+                                                           "расшифровываются, на недостающие — ссылки")
         act("Экспорт в CSV…", self.export_csv, "Таблица с таймкодами всех файлов (открывается в Excel/Google Таблицах)")
         act("Настройки…", self.open_settings)
 
@@ -885,7 +1053,7 @@ class MainWindow(QMainWindow):
             self.qs.setValue("last_dir", d)
             self.add_paths([d])
 
-    def add_paths(self, paths):
+    def add_paths(self, paths, text_only=False):
         files = []
         for p in paths:
             if os.path.isdir(p):
@@ -902,7 +1070,7 @@ class MainWindow(QMainWindow):
             if norm_path(f) in known or os.path.basename(f).startswith(".") or "_cut" in os.path.basename(f):
                 continue
             known.add(norm_path(f))
-            self._add_item(f)
+            self._add_item(f, {"status": "только расшифровка", "text_only": True} if text_only else None)
             self._remember_seen([f], save=False)
             added += 1
         self._save_session()
@@ -916,7 +1084,7 @@ class MainWindow(QMainWindow):
               "row": None, "row_how": ""}
         if state:
             it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted", "skip",
-                                                 "full_text", "text_written")
+                                                 "full_text", "text_written", "text_only")
                        if k in state and state.get(k) is not None})
         self.items[fid] = it
         self._loading = True
@@ -1203,7 +1371,7 @@ class MainWindow(QMainWindow):
         self._check_texts()
         n = 0
         for fid, it in self.items.items():
-            if it["result"] is None and not it["status"].startswith(("в очереди", "анализ")):
+            if it["result"] is None and not it.get("text_only") and not it["status"].startswith(("в очереди", "анализ")):
                 self._queue_analysis(fid)
                 n += 1
         if not n:
@@ -1225,14 +1393,27 @@ class MainWindow(QMainWindow):
             return None
         return dict(self.sheet_cfg, sheet=name, link_col="A", cuts_col="A", note_col="B")
 
+    def _text_wanted(self):
+        """Rows chosen in «Расшифровка видео…» (with every row of their videos), or None for every row."""
+        try:
+            wanted = parse_rows(self.text_spec)
+        except ValueError:
+            return None
+        if wanted is None:
+            return None
+        ids = {r["id"] for r in self.sheet_rows.values() if r["row"] in wanted}
+        return wanted | {r["row"] for r in self.sheet_rows.values() if r["id"] in ids}
+
     def _check_texts(self):
-        """Every video with a row is transcribed, fitting or not; the second copy of a video is not."""
+        """Every video with a row (of the chosen rows) is transcribed, fitting or not; the second copy of a video
+        is not."""
         if not self._text_cfg():
             return
+        wanted = self._text_wanted()
         for fid, it in self.items.items():
             if it.get("full_text") is not None or fid in self._text_pending or not it.get("row"):
                 continue
-            if "повтор" in (it.get("skip") or ""):
+            if "повтор" in (it.get("skip") or "") or (wanted is not None and it["row"] not in wanted):
                 continue
             segs = (it.get("result") or {}).get("segments")
             self._text_pending.add(fid)
@@ -1250,15 +1431,20 @@ class MainWindow(QMainWindow):
                 and self.sheet_rows.get(it["row"])][:TEXTS_PER_WRITE]
         if not todo:
             return
+        rows_of = {}  # a video standing in several rows gets its text in each of them
+        for r in self.sheet_rows.values():
+            rows_of.setdefault(r["id"], []).append(r["row"])
         updates, more = [], {}  # more: pair of columns (C+D, E+F, …) -> updates for texts longer than a cell
         for fid in todo:
             it = self.items[fid]
+            vid = self.sheet_rows[it["row"]]["id"]
             text = it["full_text"] or "(речи не найдено)"
             parts = [text[i:i + CELL_MAX] for i in range(0, len(text), CELL_MAX)]
-            updates.append({"row": it["row"], "cuts": clean_link(self.sheet_rows[it["row"]]["id"]), "note": parts[0]})
-            for k in range(1, len(parts), 2):  # about 50 minutes of speech per cell: the rest goes on to C, D, …
-                more.setdefault(k, []).append({"row": it["row"], "cuts": parts[k],
-                                               "note": parts[k + 1] if k + 1 < len(parts) else None})
+            for row in sorted(set(rows_of.get(vid, [])) | {it["row"]}):
+                updates.append({"row": row, "cuts": clean_link(vid), "note": parts[0]})
+                for k in range(1, len(parts), 2):  # about 50 minutes of speech per cell: the rest goes on to C, D, …
+                    more.setdefault(k, []).append({"row": row, "cuts": parts[k],
+                                                   "note": parts[k + 1] if k + 1 < len(parts) else None})
         for k, ups in sorted(more.items()):  # queued first: done by the time the A/B batch reports back
             first = col_letter(k + 2)
             self.net.add(0, "texts", {"cfg": dict(cfg, cuts_col=first, note_col=col_letter(k + 3)), "updates": ups,
@@ -1287,7 +1473,7 @@ class MainWindow(QMainWindow):
 
     def _resume(self):
         """Work left from the previous run goes on by itself: files without analysis, rows not found yet."""
-        if self.auto_analyze:
+        if self.watch_action != "add":
             for fid, it in self.items.items():
                 if it["result"] is None and it["status"] == "ожидает анализа":
                     self._queue_analysis(fid)
@@ -1378,6 +1564,8 @@ class MainWindow(QMainWindow):
         skipped = self._mark_skips()
         self._save_session()
         self._check_texts()
+        if self._downloader_dialog is not None:
+            self._downloader_dialog.set_have_ids(self._have_ids())
         msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
         if skipped:
             msg += f" Пропускаются (красная строка или повтор): {skipped}."
@@ -1425,9 +1613,12 @@ class MainWindow(QMainWindow):
                 it.pop("skip", None)
                 self.pool.skip.discard(fid)
                 if it["result"] is None and it["status"].startswith("пропущен"):
-                    it["status"] = "ожидает анализа"
-                    if self.auto_analyze:
-                        self._queue_analysis(fid)
+                    if it.get("text_only"):
+                        it["status"] = "только расшифровка"
+                    else:
+                        it["status"] = "ожидает анализа"
+                        if self.watch_action != "add":
+                            self._queue_analysis(fid)
             self._refresh_row(fid)
             if fid == self.current:
                 self._show_details(fid)
@@ -1483,6 +1674,56 @@ class MainWindow(QMainWindow):
         self.status_text.setText(f"Переименовано файлов: {len(done)}.")
         return done
 
+    def open_transcription(self):
+        if not self._text_cfg():
+            QMessageBox.information(self, "Расшифровка", "Сначала создайте в таблице лист для расшифровок и впишите его "
+                                    "имя в «Таблица…» → «Лист для расшифровок».")
+            return
+        self._after_fresh_rows(lambda: self._after_text_rows(self._show_transcription))
+
+    def _show_transcription(self):
+        folder = self.text_dir or (os.path.join(self.watch_dir, "для расшифровки") if self.watch_dir else "")
+        dlg = TranscriptionDialog(self, list(self.sheet_rows.values()), self.text_done_rows, self._have_ids(),
+                                  self.sheet_cfg.get("text_sheet", ""), self.text_spec, folder, True)
+        self._downloader_dialog = dlg
+        ok = dlg.exec()
+        self._downloader_dialog = None
+        if not ok:
+            return
+        self.text_spec, self.text_dir, self.text_watching = dlg.values()
+        self.qs.setValue("text_rows", self.text_spec)
+        self.qs.setValue("text_dir", self.text_dir)
+        self.qs.setValue("text_watching", "true" if self.text_watching else "false")
+        if self.text_dir and self.text_watching:
+            os.makedirs(self.text_dir, exist_ok=True)
+        if self.text_watcher.folder != self.text_dir:
+            self.text_watcher = FolderWatcher(self.text_dir)
+        self._update_watch_timer()
+        self._check_texts()
+        self.text_timer.start(3000)
+        self.status_text.setText("Расшифровка: " + (f"строки {self.text_spec}" if self.text_spec else "все строки")
+                                 + (f"; слежу за папкой {self.text_dir}" if self.text_watching and self.text_dir else ""))
+
+    def _after_text_rows(self, then):
+        """Which rows of the transcripts sheet have a text already (column A holds the link once it is written)."""
+        self._text_rows_then = then
+        self.net.add(0, "text_rows", {"cfg": dict(self._text_cfg(), link_col="A", cuts_col="A", note_col="A")})
+        self.progress.setVisible(True)
+        self.status_text.setText("Читаю лист расшифровок…")
+
+    def _have_ids(self):
+        return {self.sheet_rows[it["row"]]["id"] for it in self.items.values()
+                if it.get("row") in self.sheet_rows and "повтор" not in (it.get("skip") or "")}
+
+    def add_text_files(self, folder):
+        """Files already downloaded, for the transcripts only. Returns how many were new to the list."""
+        before = len(self.items)
+        self.add_paths([folder], text_only=True)
+        added = len(self.items) - before
+        if added:
+            self.find_rows(quiet=False)
+        return added
+
     def open_downloader(self):
         if self.sheet_cfg.get("url"):
             self._after_fresh_rows(self._show_downloader)
@@ -1493,25 +1734,38 @@ class MainWindow(QMainWindow):
     def _show_downloader(self):
         rows = list(self.sheet_rows.values()) if self.sheet_cfg.get("url") else []
         have = {it["row"] for it in self.items.values() if it.get("row")}
-        dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.auto_analyze, self,
+        dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.watch_action, self,
                                script_version=self.sheet_version or SCRIPT_VERSION)
         if dlg.exec():
             marks = dlg.repeats_to_mark()
             if marks:
                 self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": marks})
                 self.progress.setVisible(True)
-            self.watch_dir, self.watching, self.auto_analyze = dlg.values()
+            self.watch_dir, self.watching, self.watch_action = dlg.values()
             self.qs.setValue("watch_dir", self.watch_dir)
             self.qs.setValue("watching", "true" if self.watching else "false")
-            self.qs.setValue("auto_analyze", "true" if self.auto_analyze else "false")
+            self.qs.setValue("watch_action", self.watch_action)
             if self.watcher.folder != self.watch_dir:
                 self.watcher = FolderWatcher(self.watch_dir)
+            self._update_watch_timer()
             if self.watching and self.watch_dir:
-                self.watch_timer.start()
                 self.status_text.setText(f"Слежу за папкой: {self.watch_dir}")
-                self._scan_watch()
-            else:
-                self.watch_timer.stop()
+
+    def _watched(self):
+        """(watcher, what to do with its new files) for each folder being watched."""
+        out = []
+        if self.watching and self.watch_dir:
+            out.append((self.watcher, self.watch_action))
+        if self.text_watching and self.text_dir and norm_path(self.text_dir) != norm_path(self.watch_dir or "."):
+            out.append((self.text_watcher, "text"))
+        return out
+
+    def _update_watch_timer(self):
+        if self._watched():
+            self.watch_timer.start()
+            self._scan_watch()
+        else:
+            self.watch_timer.stop()
 
     def _scan_watch(self):
         """Looks at the downloads folder in a background thread: opening each new file takes a moment."""
@@ -1521,33 +1775,40 @@ class MainWindow(QMainWindow):
         known = {it["path"] for it in self.items.values()}
         known |= {it["cut"]["output"] for it in self.items.values() if it.get("cut")}
         known |= set(self.seen)  # taken before: removed from the list since, or the list was lost
-        watcher = self.watcher
+        watched = self._watched()
+        if not watched:
+            self._scanning = False
+            return
 
         def look():
+            found = []
+            for watcher, action in watched:
+                try:
+                    found.append((watcher.scan(known), action))
+                except Exception as e:  # a folder that went away, no access…: try again next time
+                    log_event(f"папка загрузок: {e}")
             try:
-                new = watcher.scan(known)
-            except Exception as e:  # a folder that went away, no access…: try again next time
-                log_event(f"папка загрузок: {e}")
-                new = []
-            try:
-                self.watch_found.emit(new)
+                self.watch_found.emit(found)
             except RuntimeError:  # the window is already closed
                 pass
         threading.Thread(target=look, daemon=True, name="watch-folder").start()
 
-    def _on_watch_found(self, new):
+    def _on_watch_found(self, found):
         self._scanning = False
-        if not new:
-            return
-        before = set(self.items)
-        self.add_paths(new)
-        added = [fid for fid in self.items if fid not in before]
-        log_event(f"из папки загрузок добавлено: {len(added)}")
-        if self.auto_analyze:
-            for fid in added:
-                self._queue_analysis(fid)
-        self.status_text.setText(f"Из папки загрузок добавлено файлов: {len(added)}"
-                                 + (" — анализ запущен" if self.auto_analyze and added else ""))
+        if found and not isinstance(found[0], tuple):  # a plain list: the usual folder
+            found = [(found, self.watch_action)]
+        for new, action in found:
+            if not new:
+                continue
+            before = set(self.items)
+            self.add_paths(new, text_only=action == "text")
+            added = [fid for fid in self.items if fid not in before]
+            log_event(f"из папки загрузок добавлено: {len(added)} ({action})")
+            if action == "analyze":
+                for fid in added:
+                    self._queue_analysis(fid)
+            self.status_text.setText(f"Из папки загрузок добавлено файлов: {len(added)}" + (
+                {"analyze": " — анализ запущен", "text": " — только расшифровка"}.get(action, "") if added else ""))
 
     def _cuts_for(self, it):
         """(cuts, canonical timecode string) for a file, from the edited field or the analysis."""
@@ -1812,6 +2073,13 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "text_rows":
+            self.text_done_rows = {r["row"] for r in res["rows"]}
+            then, self._text_rows_then = self._text_rows_then, None
+            self._maybe_idle(keep_text=True)
+            if then:
+                then()
+            return
         if kind == "names":
             if self._names_dialog is not None:
                 self._names_dialog.show_plan(res["folder"], res["plan"])
@@ -1917,6 +2185,12 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind == "text_rows":
+            self._text_rows_then = None
+            if msg != "остановлено":
+                QMessageBox.warning(self, "Расшифровка", f"Не удалось прочитать лист расшифровок: {msg.split(chr(10) * 2)[0]}")
+            self._maybe_idle()
+            return
         if kind == "names":
             if self._names_dialog is not None:
                 self._names_dialog.show_error(msg.split("\n\n")[0])
@@ -2064,13 +2338,14 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
             st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
-                (it["status"] if it["status"] == "ошибка" or it["status"].startswith("пропущен") else "ожидает анализа")
+                (it["status"] if it["status"] == "ошибка" or it["status"].startswith("пропущен") or it.get("text_only")
+                 else "ожидает анализа")
             if it["result"] and not st.startswith(("готово", "вырезано")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
                          "skip": it.get("skip"), "full_text": it.get("full_text"),
-                         "text_written": it.get("text_written", False)})
+                         "text_written": it.get("text_written", False), "text_only": it.get("text_only", False)})
         self._write_seen()
         present = {norm_path(it["path"]) for it in self.items.values()}
         self._missing = [d for d in self._missing if norm_path(d.get("path", "")) not in present]  # it came back
@@ -2118,7 +2393,8 @@ class MainWindow(QMainWindow):
                 self._missing.append(d)
                 continue
             status = d.get("status") or ""
-            if d.get("result") is None and status != "ошибка" and not status.startswith("пропущен"):
+            if d.get("result") is None and status != "ошибка" and not status.startswith("пропущен") \
+                    and not d.get("text_only"):
                 d["status"] = "ожидает анализа"  # it was waiting or being analysed
             self._add_item(d["path"], d)
         self._remember_seen([it["path"] for it in self.items.values()], save=False)

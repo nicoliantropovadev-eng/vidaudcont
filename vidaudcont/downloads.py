@@ -6,6 +6,7 @@ into a chosen folder. The program copies the links from the sheet and picks up e
 finishes downloading in the folder.
 """
 import os
+import re
 
 from . import cutter
 from .sheet import row_marked_red
@@ -64,6 +65,53 @@ def select_links(rows, first, last, skip_filled=True, skip_rows=(), stats=None):
     if stats is not None:
         stats.update(counts)
     return out
+
+
+def parse_rows(spec):
+    """"80-120, 150; 200 – 250" -> {80, …, 120, 150, 200, …, 250}; an empty text -> None (every row)."""
+    text = (spec or "").strip()
+    if not text:
+        return None
+    out = set()
+    for part in re.split(r"[,;\s]+(?![^\d]*[-–—]|\.\.)", re.sub(r"\s*(-|–|—|\.\.)\s*", "-", text)):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d{1,6})(?:-(\d{1,6}))?", part)
+        if not m:
+            raise ValueError(f"не понимаю «{part}»: пишите номера строк и диапазоны, например 80-120, 150")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if b < a:
+            a, b = b, a
+        if b - a > 100000:
+            raise ValueError(f"слишком большой диапазон: {part}")
+        out.update(range(a, b + 1))
+    return out
+
+
+def select_text_links(rows, wanted=None, done_rows=(), have_ids=(), skip_red=True, stats=None):
+    """Links still needed for the transcripts: one per video that has a row in `wanted` (None: every row), whose
+    text is in none of its rows of the transcripts sheet (done_rows) and whose file is not in the program (have_ids:
+    those are transcribed from the file). stats (a dict) receives the counts."""
+    done_rows, have_ids = set(done_rows), set(have_ids)
+    videos = {}
+    for r in sorted(rows, key=lambda r: r["row"]):
+        videos.setdefault(r["id"], []).append(r)
+    out, counts = [], {"videos": 0, "done": 0, "have": 0, "red": 0}
+    for vid, vrows in videos.items():
+        if wanted is not None and not any(r["row"] in wanted for r in vrows):
+            continue
+        counts["videos"] += 1
+        if any(r["row"] in done_rows for r in vrows):
+            counts["done"] += 1
+        elif vid in have_ids:
+            counts["have"] += 1
+        elif skip_red and row_marked_red(vrows[0]):
+            counts["red"] += 1
+        else:
+            out.append((vrows[0]["row"], clean_link(vid)))
+    if stats is not None:
+        stats.update(counts)
+    return sorted(out)
 
 
 def write_links(path, links):

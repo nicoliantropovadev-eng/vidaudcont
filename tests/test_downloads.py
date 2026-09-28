@@ -89,3 +89,31 @@ def test_known_files_are_not_opened_again_whatever_the_spelling(tmp_path, monkey
     w.scan(known)
     assert w.scan(known) == [os.path.abspath(tmp_path / "b.m4a")]
     assert opened == [os.path.abspath(tmp_path / "b.m4a")]
+
+
+def test_links_still_needed_for_the_transcripts():
+    from vidaudcont.downloads import select_text_links
+    rows = [{"row": 5, "id": "AAAAAAAAAA1"}, {"row": 80, "id": "AAAAAAAAAA1"},            # one video, two rows
+            {"row": 81, "id": "BBBBBBBBBB2"},                                             # text already in the sheet
+            {"row": 82, "id": "CCCCCCCCCC3"},                                             # its file is in the program
+            {"row": 83, "id": "DDDDDDDDDD4", "bg": ["#ff0000"]},                          # marked red
+            {"row": 84, "id": "EEEEEEEEEE5"}]
+    stats = {}
+    got = select_text_links(rows, None, done_rows={81}, have_ids={"CCCCCCCCCC3"}, stats=stats)
+    assert got == [(5, "https://www.youtube.com/watch?v=AAAAAAAAAA1"), (84, "https://www.youtube.com/watch?v=EEEEEEEEEE5")]
+    assert stats == {"videos": 5, "done": 1, "have": 1, "red": 1}
+    assert [r for r, _ in select_text_links(rows, None, {81}, {"CCCCCCCCCC3"}, skip_red=False)] == [5, 83, 84]
+    assert [r for r, _ in select_text_links(rows, {80})] == [5]         # a wanted row brings its video
+
+
+def test_row_lists():
+    from vidaudcont.downloads import parse_rows
+    assert parse_rows("") is None and parse_rows("   ") is None
+    assert parse_rows("80-83, 150; 200 – 201 7") == {80, 81, 82, 83, 150, 200, 201, 7}
+    assert parse_rows("12..10") == {10, 11, 12}
+    for bad in ("80-", "abc", "5-x"):
+        try:
+            parse_rows(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)

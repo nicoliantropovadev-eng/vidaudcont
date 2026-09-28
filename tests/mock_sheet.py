@@ -97,11 +97,11 @@ class MockSheet:
             return {"ok": True, "version": self.version, "spreadsheet": "Mock", "sheet": "Sheet1", "last_row": len(self.grid)}
         if p.get("action") == "rows":
             rows = []
-            for i in range(1, len(self.grid) + 1):
-                m = re.search(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]{11})", self.cell(i, link))
+            for i in range(1, len(self.sheets[sheet]) + 1):
+                m = re.search(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]{11})", self.cell(i, link, sheet))
                 if m:
-                    rows.append({"row": i, "link": self.cell(i, link), "id": m.group(1),
-                                 "cuts": self.cell(i, cuts), "note": self.cell(i, note)})
+                    rows.append({"row": i, "link": self.cell(i, link, sheet), "id": m.group(1),
+                                 "cuts": self.cell(i, cuts, sheet), "note": self.cell(i, note, sheet)})
                     if self.version >= 2:
                         rows[-1].update(self.colors.get(i, {"bg": [], "fg": "#000000"}))
             return {"ok": True, "sheet": "Sheet1", "rows": rows} | ({"version": self.version} if self.version >= 2 else {})

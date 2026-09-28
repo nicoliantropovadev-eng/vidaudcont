@@ -212,6 +212,7 @@ def test_window_never_waits_for_the_folder_or_the_file_list(tmp_path, monkeypatc
         (tmp_path / f"видео {i}.m4a").write_bytes(b"x" * 100)
     w = MainWindow()
     w.add_paths([str(tmp_path / "видео 0.m4a"), str(tmp_path / "видео 1.m4a")])  # already in the list
+    w.watch_dir, w.watching, w.watch_action = str(tmp_path), True, "add"
     w.watcher = FolderWatcher(str(tmp_path) + "/./")
     w._scan_watch()
     wait(app, lambda: not w._scanning)
@@ -572,6 +573,68 @@ def test_name_check_dialog_renames_and_keeps_the_list_right(tmp_path, monkeypatc
         assert sorted(os.listdir(done)) == ["2.m4a", "3.m4a"]
         assert w.items[fid]["cut"]["output"] == str(done / "2.m4a")      # the list follows the file
         w._names_dialog = None
+        w.close()
+    finally:
+        sheet.close()
+
+
+@pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
+def test_transcription_of_chosen_rows(tmp_path, monkeypatch):
+    """«Расшифровка видео…»: chosen rows, files already at hand added from a folder (only transcribed), links for the
+    videos still missing, and downloads into the transcription folder only transcribed; the text of a video standing
+    in two rows goes to both rows of the transcripts sheet."""
+    from vidaudcont import matching
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    names = {"AAAAAAAAAA1": "Talk one", "BBBBBBBBBB2": "Talk two", "CCCCCCCCCC3": "Talk three", "DDDDDDDDDD4": "Talk four"}
+    monkeypatch.setattr(matching, "original_title", lambda vid: names[vid])
+    monkeypatch.setattr(matching, "localized_title", lambda vid, lang="ru": "")
+    grid = [["", "", "Link", "", ""]] + [["", "", f"https://youtu.be/{v}", "", ""] for v in
+                                        ("AAAAAAAAAA1", "BBBBBBBBBB2", "AAAAAAAAAA1", "CCCCCCCCCC3", "DDDDDDDDDD4")]
+    texts = [[], [], ["https://www.youtube.com/watch?v=BBBBBBBBBB2", "уже есть"]]   # row 3 has its text already
+    sheet = MockSheet(grid, key="k", sheets={"Расшифровки": texts})
+    try:
+        from vidaudcont.gui.main_window import MainWindow, TranscriptionDialog
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "text_sheet": "Расшифровки"}
+        w._after_fresh_rows(lambda: w._after_text_rows(lambda: None))
+        wait(app, lambda: w.text_done_rows == {3} and w.net.pending == 0)
+        have = tmp_path / "старые файлы"
+        have.mkdir()
+        shutil.copy(resources.asset("selftest.m4a"), have / "Talk three.m4a")      # row 5 is at hand
+        dlg = TranscriptionDialog(w, list(w.sheet_rows.values()), w.text_done_rows, w._have_ids(), "Расшифровки",
+                                  "2-5", str(tmp_path / "для расшифровки"), True)
+        w._downloader_dialog = dlg
+        assert [r for r, _ in dlg.links()] == [2, 5]          # 3 has a text, 4 repeats 2, 6 is not chosen
+        dlg.spec.setText("2-x")
+        assert "не понимаю" in dlg.summary.text() and dlg.links() == []
+        dlg.spec.setText("2-5")
+        dlg.window.add_text_files(str(have))                   # "Добавить папку с аудио…"
+        wait(app, lambda: [r for r, _ in dlg.links()] == [2], timeout=60)
+        assert "youtube.com/watch?v=AAAAAAAAAA1" in dlg.links_box.toPlainText()
+        w._downloader_dialog = None
+        w.text_spec, w.text_dir, w.text_watching = dlg.values()
+        os.makedirs(w.text_dir)
+        from vidaudcont.downloads import FolderWatcher
+        w.text_watcher = FolderWatcher(w.text_dir)
+        shutil.copy(resources.asset("selftest.m4a"), os.path.join(w.text_dir, "Talk one.m4a"))  # downloaded
+        for _ in range(2):
+            w._scan_watch()
+            wait(app, lambda: not w._scanning, timeout=60)
+        w._check_texts()
+        items = {os.path.basename(it["path"]): it for it in w.items.values()}
+        assert set(items) == {"Talk three.m4a", "Talk one.m4a"}
+        assert all(it.get("text_only") and it["status"] == "только расшифровка" for it in items.values())
+        wait(app, lambda: all(it.get("full_text") is not None for it in items.values()), timeout=300)
+        assert all(it["result"] is None for it in items.values())            # nothing analysed
+        w._flush_texts()
+        wait(app, lambda: all(it.get("text_written") for it in items.values()) and w.net.pending == 0, timeout=60)
+        text = sheet.cell(2, 2, "Расшифровки")
+        assert "carrot" in text.lower() and sheet.cell(4, 2, "Расшифровки") == text   # row 4 repeats row 2
+        assert sheet.cell(5, 2, "Расшифровки") and sheet.cell(6, 2, "Расшифровки") == ""  # 6 was not chosen
         w.close()
     finally:
         sheet.close()
