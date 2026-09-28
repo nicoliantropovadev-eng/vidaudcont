@@ -93,7 +93,9 @@ def test_matching_names_like_the_downloader(sheet, tmp_path):
         "02b.Physical Exam -Head and Neck -part 2 3.m4a": 4,                         # original title
         "Клинический пример исследования случая первый сеанс с клиентом с симп....m4a": 5,  # cut short
         "01.Complete History & Physical Exam -part 4.avi.m4a": 6,                    # starts with a number
-        "6. anything.m4a": 6,                                                         # row number prefix
+        "6.m4a": 6,                                                                   # named after the row
+        "6. anything.m4a": None,                          # a number before an unknown name is not a row...
+        "4 things to know.m4a": None,                     # ...titles like "7 Tips for…" start with numbers
         "Some title [MK1f4-h5cxs].m4a": 4,                                            # id in the name
         "Совсем другое видео.m4a": None,
     }

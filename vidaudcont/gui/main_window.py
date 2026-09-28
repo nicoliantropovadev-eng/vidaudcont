@@ -22,6 +22,7 @@ from ..engine.analyzer import Settings, default_threads, suitability
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import FolderWatcher, clean_link, first_rows, norm_path, repeats, select_links, write_links
+from .. import naming
 from ..matching import TitleCache, match_files
 from ..sheet import (SCRIPT_VERSION, SheetClient, SheetError, export_connection, import_connection, new_key,
                      row_marked_red, script_code)
@@ -127,6 +128,14 @@ class Worker(QThread):
             try:
                 if kind == "match":
                     res = self._match(payload, report)
+                elif kind == "names":
+                    rows = SheetClient.from_config(payload["cfg"], retries=2, cancelled=self.cancel_flag.is_set).rows()
+                    cache = TitleCache(payload["cache_path"])
+                    cache.fetch([r["id"] for r in rows], lang=payload["lang"], cancelled=self.cancel_flag.is_set,
+                                progress=lambda f, t: report(0.05 + 0.25 * f, t))
+                    res = {"folder": payload["folder"], "plan": naming.check_folder(
+                        payload["folder"], rows, cache.data, payload["lang"], payload["sources"],
+                        progress=lambda f, t: report(0.3 + 0.7 * f, t))}
                 elif kind == "texts":  # transcripts into their own sheet: A = link, B = text, same row numbers
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
                     res = {"fids": payload["fids"]}
@@ -161,7 +170,7 @@ class Worker(QThread):
     def _cut(self, payload, report):
         if payload["cuts"]:
             res = cutter.cut(payload["path"], payload["cuts"], out_path=payload.get("out_path"), mode=payload["mode"],
-                             progress=report, cancelled=self.cancel_flag.is_set)
+                             progress=report, cancelled=self.cancel_flag.is_set, tags=payload.get("tags"))
         else:  # nothing to cut: the file is only copied under its new name (bit-for-bit)
             os.makedirs(os.path.dirname(payload["out_path"]), exist_ok=True)
             shutil.copy2(payload["path"], payload["out_path"])
@@ -425,6 +434,87 @@ class SheetDialog(QDialog):
                     text_sheet=self.text_sheet.text().strip())
 
 
+class NameCheckDialog(QDialog):
+    """Row numbers in file names against the sheet: check a folder, show what differs, rename on request."""
+
+    def __init__(self, window, folder):
+        super().__init__(window)
+        self.window, self.plan = window, []
+        self.setWindowTitle("Проверка имён файлов")
+        self.setMinimumSize(760, 480)
+        lay = QVBoxLayout(self)
+        about = QLabel("Программа узнаёт, какое видео в каждом файле, по ссылке или названию внутри файла, и сверяет "
+                       "число в начале имени (например, «80» в «80.m4a») со строкой этого видео в таблице. Файлы, у "
+                       "которых имя не начинается с числа, не трогаются.")
+        about.setWordWrap(True)
+        lay.addWidget(about)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Папка:"))
+        self.folder = QLineEdit(folder)
+        row.addWidget(self.folder, 1)
+        browse = QPushButton("…")
+        browse.clicked.connect(self._browse)
+        row.addWidget(browse)
+        self.b_check = QPushButton("Проверить")
+        self.b_check.clicked.connect(self._check)
+        row.addWidget(self.b_check)
+        lay.addLayout(row)
+        self.report = QPlainTextEdit()
+        self.report.setReadOnly(True)
+        lay.addWidget(self.report, 1)
+        buttons = QHBoxLayout()
+        self.b_rename = QPushButton("Переименовать")
+        self.b_rename.setEnabled(False)
+        self.b_rename.clicked.connect(self._rename)
+        buttons.addWidget(self.b_rename)
+        buttons.addStretch(1)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(self.reject)
+        buttons.addWidget(close)
+        lay.addLayout(buttons)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка с файлами для проверки", self.folder.text())
+        if d:
+            self.folder.setText(d)
+
+    def _check(self):
+        folder = self.folder.text().strip()
+        if not os.path.isdir(folder):
+            self.report.setPlainText("Такой папки нет — выберите папку кнопкой «…».")
+            return
+        self.b_check.setEnabled(False)
+        self.b_rename.setEnabled(False)
+        self.report.setPlainText("Проверяю… (читаю таблицу и открываю каждый файл)")
+        self.window.check_names(folder)
+
+    def show_plan(self, folder, plan):
+        self.b_check.setEnabled(True)
+        self.plan, self.checked_folder = plan, folder
+        wrong = [x for x in plan if x["new"]]
+        unknown = [x for x in plan if not x["row"]]
+        lines = [f"Файлов с номером в имени: {len(plan)}. Совпадают со строкой: {len(plan) - len(wrong) - len(unknown)}. "
+                 f"Нужно переименовать: {len(wrong)}. Не удалось узнать видео: {len(unknown)}.", ""]
+        lines += [f"{x['name']}  →  {x['new']}   (строка {x['row']}; {x['how']})" for x in wrong]
+        if unknown:
+            lines += ["", "Не удалось узнать (оставлены как есть):"] + [f"{x['name']} — {x['how']}" for x in unknown]
+        self.report.setPlainText("\n".join(lines))
+        self.b_rename.setText(f"Переименовать ({len(wrong)})")
+        self.b_rename.setEnabled(bool(wrong))
+
+    def show_error(self, msg):
+        self.b_check.setEnabled(True)
+        self.report.setPlainText(f"Не удалось проверить: {msg}")
+
+    def _rename(self):
+        done = self.window.apply_renames(self.checked_folder, self.plan)
+        self.b_rename.setEnabled(False)
+        self.report.setPlainText(f"Переименовано: {len(done)}.\n\n" + "\n".join(
+            f"{os.path.basename(a)}  →  {os.path.basename(b)}" for a, b in done) +
+            "\n\nТаймкоды в колонке D программа не переносит: если файл был назван не той строкой, проверьте в "
+            "таблице обе строки — старую и новую.")
+
+
 class DownloaderDialog(QDialog):
     """Links for 4K Video Downloader+ and the folder the program watches for finished downloads."""
 
@@ -596,6 +686,8 @@ class MainWindow(QMainWindow):
         self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
         self._dialogue_pending = set()  # files whose conversation check is queued
         self._text_pending = set()      # files whose transcription is queued
+        self._names_dialog = None
+        self.seen = self._load_seen()   # every file ever added: the downloads folder gives each only once
         self._texts_in_flight = set()   # transcripts being written to the table
         self.text_timer = QTimer(self)  # transcripts go to the table in batches
         self.text_timer.setSingleShot(True)
@@ -653,6 +745,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         act("Таблица…", self.open_sheet, "Подключение к Google Таблице")
         act("Найти строки", self.find_rows, "Определить, в какой строке таблицы ссылка на каждый файл")
+        act("Проверить имена…", self.open_name_check, "Сверить номера в именах файлов со строками таблицы "
+                                                      "и исправить несовпадающие")
         act("4K Video Downloader+…", self.open_downloader, "Ссылки из таблицы для загрузки и папка, за которой "
                                                            "следит программа")
         act("Экспорт в CSV…", self.export_csv, "Таблица с таймкодами всех файлов (открывается в Excel/Google Таблицах)")
@@ -809,6 +903,7 @@ class MainWindow(QMainWindow):
                 continue
             known.add(norm_path(f))
             self._add_item(f)
+            self._remember_seen([f], save=False)
             added += 1
         self._save_session()
         if added and self.sheet_cfg.get("url"):
@@ -1351,6 +1446,43 @@ class MainWindow(QMainWindow):
         return [it["path"] for it in self.items.values() if it.get("row") is None and it.get("row_how") != "вручную"
                 and not it.get("_match_tried")]
 
+    def open_name_check(self):
+        if not self.sheet_cfg.get("url"):
+            QMessageBox.information(self, "Проверка имён", "Сначала подключите таблицу: кнопка «Таблица…».")
+            return
+        folder = self.qs.value("names_dir", "") or ""
+        if not os.path.isdir(folder):
+            base = self.extra.get("out_dir") or (os.path.join(self.watch_dir, "готово") if self.watch_dir else "")
+            folder = base if os.path.isdir(base) else self.watch_dir
+        self._names_dialog = NameCheckDialog(self, folder)
+        self._names_dialog.exec()
+        self._names_dialog = None
+
+    def check_names(self, folder):
+        self.qs.setValue("names_dir", folder)
+        sources = {norm_path(it["cut"]["output"]): it["path"] for it in self.items.values() if it.get("cut")}
+        self.net.add(0, "names", {"cfg": self.sheet_cfg, "folder": folder, "sources": sources,
+                                  "lang": self.sheet_cfg.get("lang", "ru"),
+                                  "cache_path": os.path.join(app_data_dir(), "titles.json")})
+        self.progress.setVisible(True)
+
+    def apply_renames(self, folder, plan):
+        """Renames the files and keeps the program's list pointing at them."""
+        done = naming.rename(folder, plan)
+        moved = {norm_path(a): b for a, b in done}
+        for fid, it in self.items.items():
+            if norm_path(it["path"]) in moved:
+                it["path"] = moved[norm_path(it["path"])]
+                self.table.item(self._row_of(fid), C_FILE).setText(os.path.basename(it["path"]))
+            if it.get("cut") and norm_path(it["cut"]["output"]) in moved:
+                it["cut"]["output"] = moved[norm_path(it["cut"]["output"])]
+            self._refresh_row(fid)
+        self._remember_seen([b for _, b in done])
+        self._save_session()
+        log_event(f"переименовано по строкам таблицы: {len(done)} в {folder}")
+        self.status_text.setText(f"Переименовано файлов: {len(done)}.")
+        return done
+
     def open_downloader(self):
         if self.sheet_cfg.get("url"):
             self._after_fresh_rows(self._show_downloader)
@@ -1388,6 +1520,7 @@ class MainWindow(QMainWindow):
         self._scanning = True
         known = {it["path"] for it in self.items.values()}
         known |= {it["cut"]["output"] for it in self.items.values() if it.get("cut")}
+        known |= set(self.seen)  # taken before: removed from the list since, or the list was lost
         watcher = self.watcher
 
         def look():
@@ -1573,10 +1706,13 @@ class MainWindow(QMainWindow):
         else:
             return  # nothing to cut and no row to name it after
         upd = self._sheet_update(it, tc)
+        info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
         it["status"] = "в очереди на вырезание"
         self._refresh_row(fid)
         self.worker.add(fid, "cut", {"path": it["path"], "cuts": cuts, "tc": tc, "mode": mode, "out_path": out,
-                                     "sheet": {"cfg": self.sheet_cfg, "update": upd} if upd else None})
+                                     "sheet": {"cfg": self.sheet_cfg, "update": upd} if upd else None,
+                                     # "Проверить имена…" recognises the file by this link, whatever its name
+                                     "tags": {"comment": clean_link(info["id"])} if info else None})
         self.progress.setVisible(True)
 
     def _queue_rewrite(self, fids):
@@ -1676,6 +1812,11 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "names":
+            if self._names_dialog is not None:
+                self._names_dialog.show_plan(res["folder"], res["plan"])
+            self._maybe_idle(keep_text=True)
+            return
         if kind == "transcribe":
             self._text_pending.discard(fid)
             it = self.items.get(fid)
@@ -1776,6 +1917,11 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind == "names":
+            if self._names_dialog is not None:
+                self._names_dialog.show_error(msg.split("\n\n")[0])
+            self._maybe_idle()
+            return
         if kind in ("transcribe", "texts"):  # no window: the file keeps its analysis, the text comes later
             self._text_pending.discard(fid)
             if kind == "texts":
@@ -1868,6 +2014,42 @@ class MainWindow(QMainWindow):
                             it["cut"]["output"] if it.get("cut") else "", it["path"]])
         self.status_text.setText(f"Сохранено: {path}")
 
+    def _seen_file(self):
+        return os.path.join(app_data_dir(), "seen_files.json")
+
+    def _load_seen(self):
+        try:
+            with open(self._seen_file(), encoding="utf-8") as f:
+                return set(json.load(f))
+        except (OSError, ValueError):
+            pass
+        # first start of a version that keeps this list: what was in the downloads folder before the program was
+        # last closed has been taken already (files from later downloads stay new)
+        seen = set()
+        try:
+            since = os.path.getmtime(self._session_file())
+            if self.watch_dir and os.path.isdir(self.watch_dir):
+                for n in os.listdir(self.watch_dir):
+                    path = os.path.join(self.watch_dir, n)
+                    if os.path.splitext(n)[1].lower() in MEDIA_EXT and os.path.getmtime(path) < since:
+                        seen.add(norm_path(path))
+        except OSError:
+            pass
+        return seen
+
+    def _remember_seen(self, paths, save=True):
+        self.seen |= {norm_path(p) for p in paths}
+        if save:
+            self._write_seen()
+
+    def _write_seen(self):
+        try:
+            with open(self._seen_file() + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(sorted(self.seen), f, ensure_ascii=False)
+            os.replace(self._seen_file() + ".tmp", self._seen_file())
+        except OSError as e:
+            log_event(f"не удалось сохранить список уже взятых файлов: {e!r}")
+
     def _session_file(self):
         return os.path.join(app_data_dir(), "session.json")
 
@@ -1889,6 +2071,7 @@ class MainWindow(QMainWindow):
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
                          "skip": it.get("skip"), "full_text": it.get("full_text"),
                          "text_written": it.get("text_written", False)})
+        self._write_seen()
         present = {norm_path(it["path"]) for it in self.items.values()}
         self._missing = [d for d in self._missing if norm_path(d.get("path", "")) not in present]  # it came back
         data += self._missing
@@ -1938,6 +2121,7 @@ class MainWindow(QMainWindow):
             if d.get("result") is None and status != "ошибка" and not status.startswith("пропущен"):
                 d["status"] = "ожидает анализа"  # it was waiting or being analysed
             self._add_item(d["path"], d)
+        self._remember_seen([it["path"] for it in self.items.values()], save=False)
         log_event(f"список файлов восстановлен: {len(self.items)}, нет на диске: {len(self._missing)}")
         if self._missing:
             names = "\n".join(os.path.basename(d.get("path", "")) for d in self._missing[:5])

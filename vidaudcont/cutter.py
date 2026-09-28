@@ -191,7 +191,7 @@ def _ffmpeg(args, progress=None, frac0=0.0, frac1=1.0, seconds=0.0, cancelled=No
             raise CutError("ffmpeg: " + err.read().decode(errors="replace").strip()[-500:])
 
 
-def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, verify_result=True):
+def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, verify_result=True, tags=None):
     """Remove `cuts` [(start, end)] from `path` without re-encoding. Returns a report dict.
 
     Each kept part is first copied into its own temporary file (so it gets correct timestamps of its
@@ -207,6 +207,8 @@ def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, v
     os.makedirs(folder, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix=".vidaudcont-", dir=folder)
     faststart = ["-movflags", "+faststart"] if out_ext in MP4_LIKE else []
+    # container tags on top of the source's (e.g. the video's link): text next to the sound, which is not touched
+    faststart += [x for k, v in (tags or {}).items() for x in ("-metadata", f"{k}={v}")]
     try:
         tmp_out = os.path.join(tmpdir, "result" + out_ext)
         if p["method"] == "lossless":
@@ -244,7 +246,7 @@ def cut(path, cuts, out_path=None, mode="auto", progress=None, cancelled=None, v
                 _ffmpeg(["-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", lst] + maps +
                         ["-sn", "-dn", "-c", "copy", joined], progress, 0.9, 0.94, total, cancelled, "склейка")
                 _ffmpeg(["-i", joined, "-i", path, "-map_metadata", "1", "-map_chapters", "-1", "-map", "0",
-                         "-c", "copy", tmp_out], progress, 0.94, 0.97, total, cancelled, "склейка")
+                         "-c", "copy"] + faststart + [tmp_out], progress, 0.94, 0.97, total, cancelled, "склейка")
             else:
                 _ffmpeg(["-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", lst, "-i", path,
                          "-map_metadata", "1", "-map_chapters", "-1"] + maps +

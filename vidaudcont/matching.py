@@ -4,7 +4,8 @@ Downloaders name files after the video title - often YouTube's automatic transla
 viewer's language ("How Do You Partner…" -> "Как работать с немотивированным пациентом.m4a"),
 with characters like "/" "|" "?" dropped and long titles cut short. So the program fetches, for
 every video in the sheet, the title in the same language (and the original one) and compares
-normalised names. A row number at the start of the name ("80. …") or the video id in it wins.
+normalised names. The video id in the name wins. A number at the start of a name is usually part of
+the title ("7 Tips for…"): it counts as a row only when the name is nothing but that number ("80.m4a").
 """
 import concurrent.futures as cf
 import difflib
@@ -19,6 +20,7 @@ import urllib.request
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 ID_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
 PREFIX_RE = re.compile(r"^\s*(\d{1,5})\s*(?:[.)_\-–—]|\s|$)")
+ROW_ONLY_RE = re.compile(r"\s*(\d{1,5})\s*(?:\(\d{1,3}\))?\s*")
 
 
 def normalize(s):
@@ -117,7 +119,7 @@ class TitleCache:
 # ------------------------------------------------------------------ matching
 def match_files(paths, rows, titles, lang="ru"):
     """paths: files; rows: [{row, id, ...}] from the sheet; titles: {id: {"orig":…, lang:…}}.
-    Returns {path: (row or None, how)} where how is 'номер в имени', 'id в имени', 'название', 'похоже'."""
+    Returns {path: (row or None, how)} where how is 'id в имени', 'название', 'похоже', 'номер строки'."""
     by_row = {r["row"]: r for r in rows}
     by_id = {}
     for r in rows:
@@ -139,11 +141,11 @@ def match_files(paths, rows, titles, lang="ru"):
         if ids:
             result[p] = (by_id[ids[0]]["row"], "id в имени")
             continue
-        m = PREFIX_RE.match(base)
-        if m and int(m.group(1)) in by_row:
-            result[p] = (int(m.group(1)), "номер в имени")
-            continue
-        result[p] = _by_title(file_keys(p), keys, exact)
+        row, how = _by_title(file_keys(p), keys, exact)
+        m = ROW_ONLY_RE.fullmatch(base)
+        if row is None and m and int(m.group(1)) in by_row:  # "80.m4a", "80 (1).m4a": named after the row
+            row, how = int(m.group(1)), "номер строки"
+        result[p] = (row, how)
     return result
 
 

@@ -21,7 +21,7 @@ def fresh_app_state():
     QSettings("VidAudCont", "VidAudCont").clear()
     d = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
     for name in os.listdir(d) if os.path.isdir(d) else []:
-        if name.startswith(("session.json", "titles.json")):  # with the spare and put-aside copies
+        if name.startswith(("session.json", "titles.json", "seen_files.json")):  # with spare and put-aside copies
             os.remove(os.path.join(d, name))
 
 
@@ -495,6 +495,83 @@ def test_every_video_is_transcribed_into_its_own_sheet(tmp_path, monkeypatch):
         full = w.items[fids[0]]["full_text"]
         cells = [sheet.cell(2, c, "Расшифровки") for c in range(2, 2 + (len(full) + 39) // 40)]
         assert "".join(cells) == full and all(len(c) <= 40 for c in cells)
+        w.close()
+    finally:
+        sheet.close()
+
+
+def test_downloads_folder_gives_each_file_once(tmp_path):
+    """A file taken from the downloads folder and then removed from the list is not picked up again."""
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    from vidaudcont.downloads import FolderWatcher
+    from vidaudcont.gui.main_window import MainWindow
+    w = MainWindow()
+    w.auto_analyze = False
+    w.watch_dir, w.watching = str(tmp_path), True
+    w.watcher = FolderWatcher(str(tmp_path))
+    shutil.copy(resources.asset("selftest.m4a"), tmp_path / "готовое видео.m4a")
+
+    def look():
+        w._scan_watch()
+        wait(app, lambda: not w._scanning, timeout=60)
+    look()
+    look()
+    assert len(w.items) == 1
+    w.table.selectRow(0)
+    w.remove_selected()                     # removed from the list, the file stays in the folder
+    assert not w.items
+    w.close()
+    w2 = MainWindow()                       # even after a restart
+    w2.auto_analyze = False
+    w2.watch_dir, w2.watching = str(tmp_path), True
+    w2.watcher = FolderWatcher(str(tmp_path))
+    for _ in range(2):
+        w2._scan_watch()
+        wait(app, lambda: not w2._scanning, timeout=60)
+    assert not w2.items
+    w2.add_paths([str(tmp_path / "готовое видео.m4a")])   # adding it by hand still works
+    assert len(w2.items) == 1
+    w2.close()
+
+
+def test_name_check_dialog_renames_and_keeps_the_list_right(tmp_path, monkeypatch):
+    import subprocess
+
+    from vidaudcont import matching
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(matching, "original_title", lambda vid: {"AAAAAAAAAA1": "Taking a history",
+                                                                 "BBBBBBBBBB2": "7 Tips for bad news"}[vid])
+    monkeypatch.setattr(matching, "localized_title", lambda vid, lang="ru": "")
+    grid = [["", "", "Link", "", ""], ["", "", "https://youtu.be/AAAAAAAAAA1", "", ""],
+            ["", "", "https://youtu.be/BBBBBBBBBB2", "", ""]]
+    sheet = MockSheet(grid, key="k")
+    try:
+        from vidaudcont.gui.main_window import MainWindow, NameCheckDialog
+        done = tmp_path / "готово"
+        done.mkdir()
+        for name, title in (("3.m4a", "Taking a history"), ("7.m4a", "7 Tips for bad news")):
+            subprocess.run([resources.tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", "-c:a",
+                            "aac", "-metadata", f"title={title}", str(done / name)], check=True)
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
+        src = tmp_path / "Taking a history.m4a"
+        shutil.copy(done / "3.m4a", src)
+        fid = w._add_item(str(src), {"status": "вырезано ✓", "row": 3, "cut": {"output": str(done / "3.m4a")},
+                                     "result": {"duration": 1.0, "speech_ratio": 1.0, "timecodes": "good", "cuts": [],
+                                                "segments": [], "hints": [], "transcript": ""}})
+        dlg = NameCheckDialog(w, str(done))
+        w._names_dialog = dlg
+        dlg._check()
+        wait(app, lambda: dlg.b_check.isEnabled(), timeout=60)
+        assert "Нужно переименовать: 2" in dlg.report.toPlainText(), dlg.report.toPlainText()
+        dlg._rename()
+        assert sorted(os.listdir(done)) == ["2.m4a", "3.m4a"]
+        assert w.items[fid]["cut"]["output"] == str(done / "2.m4a")      # the list follows the file
+        w._names_dialog = None
         w.close()
     finally:
         sheet.close()
