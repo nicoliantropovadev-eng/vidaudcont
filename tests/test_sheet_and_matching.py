@@ -105,3 +105,17 @@ def test_title_cache_uses_both_titles(monkeypatch, tmp_path):
     again = matching.TitleCache(str(tmp_path / "t.json"))
     assert again.fetch(list(TITLES)) == 0  # everything cached on disk
     assert again.data["4Y3EGPjhiXE"]["ru"].startswith("Как работать")
+
+
+def test_connection_moves_to_another_computer(sheet):
+    from vidaudcont.sheet import export_connection, import_connection
+    line = export_connection({"url": sheet.url, "key": "k", "sheet": "", "link_col": "C", "overwrite": True})
+    assert line.startswith("VIDAUDCONT-CONNECTION:") and "k" not in line.split(":", 1)[1][:2]
+    got = import_connection("  " + line[:30] + "\n" + line[30:] + "  ")   # wrapped by a messenger
+    assert got == {"url": sheet.url, "key": "k", "link_col": "C"}
+    assert SheetClient(got["url"], got["key"]).ping()["ok"]
+    for bad in ("", "https://script.google.com/macros/s/x/exec", "VIDAUDCONT-CONNECTION:%%%"):
+        with pytest.raises(ValueError):
+            import_connection(bad)
+    with pytest.raises(SheetError, match="Скопировать подключение"):
+        SheetClient(sheet.url, "другой").rows()

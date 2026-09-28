@@ -419,3 +419,21 @@ def test_the_same_file_twice_in_the_list_becomes_one(tmp_path, monkeypatch):
     saved = json.load(open(session, encoding="utf-8"))
     assert sorted(os.path.basename(d["path"]) for d in saved) == ["видео.m4a", "позже.m4a"]
     w.close()
+
+
+def test_sheet_dialog_copies_the_connection_to_another_computer():
+    app = QApplication.instance() or QApplication([])
+    from PySide6.QtGui import QGuiApplication
+
+    from vidaudcont.gui.main_window import SheetDialog
+    first = SheetDialog({"url": "https://script.google.com/macros/s/AKfy/exec", "key": "secret1", "cuts_col": "F"})
+    first._export()
+    second = SheetDialog({})                       # a new computer: its own new key...
+    assert second.cfg["key"] != "secret1"
+    second._import()                               # ...replaced by the one the script in the table knows
+    v = second.values()
+    assert (v["url"], v["key"], v["cuts_col"]) == ("https://script.google.com/macros/s/AKfy/exec", "secret1", "F")
+    QGuiApplication.clipboard().setText("что-то другое")
+    second._import()
+    assert "не подключение" in second.ping_result.text()
+    app.processEvents()

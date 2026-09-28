@@ -3,6 +3,7 @@
 The script runs inside the user's spreadsheet under their Google account, so the program needs no
 Google Cloud project or sign-in: it only knows the web app URL and a shared key.
 """
+import base64
 import colorsys
 import http.client
 import json
@@ -30,6 +31,29 @@ class SheetError(RuntimeError):
 
 
 SCRIPT_VERSION = 2  # the connector that reports row colours
+CONNECTION_PREFIX = "VIDAUDCONT-CONNECTION:"
+CONNECTION_FIELDS = ("url", "key", "sheet", "link_col", "cuts_col", "note_col")
+
+
+def export_connection(cfg):
+    """The table connection as one line of text, to set up the program on another computer. The script in
+    the table accepts one key: every computer has to use the same address and key (never a new script)."""
+    data = {k: cfg.get(k) for k in CONNECTION_FIELDS if cfg.get(k)}
+    return CONNECTION_PREFIX + base64.urlsafe_b64encode(json.dumps(data).encode("utf-8")).decode("ascii")
+
+
+def import_connection(text):
+    """The fields of a line made by export_connection (spaces and line breaks added by messengers are ignored)."""
+    text = "".join((text or "").split())
+    if not text.startswith(CONNECTION_PREFIX):
+        raise ValueError("это не подключение VidAudCont: на другом компьютере нажмите «Скопировать подключение»")
+    try:
+        data = json.loads(base64.urlsafe_b64decode(text[len(CONNECTION_PREFIX):].encode("ascii")))
+    except ValueError:
+        raise ValueError("строка подключения повреждена — скопируйте её ещё раз целиком") from None
+    if not (isinstance(data, dict) and data.get("url") and data.get("key")):
+        raise ValueError("в строке подключения нет адреса или ключа")
+    return {k: str(data[k]) for k in CONNECTION_FIELDS if data.get(k)}
 
 
 def is_red(color):
@@ -133,7 +157,8 @@ class SheetClient:
         if not data.get("ok"):
             err = data.get("error", "неизвестная ошибка")
             if err == "wrong key":
-                err = "ключ не совпадает: скопируйте код скрипта из программы заново и сделайте новое развёртывание"
+                err = ("ключ не совпадает: код в таблице поставлен с другого компьютера. Там откройте «Таблица…» → "
+                       "«Скопировать подключение», а здесь — «Вставить подключение». Код в Apps Script не меняйте")
             raise SheetError(err)
         return data
 

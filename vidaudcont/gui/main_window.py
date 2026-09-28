@@ -23,7 +23,8 @@ from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import FolderWatcher, first_rows, norm_path, repeats, select_links, write_links
 from ..matching import TitleCache, match_files
-from ..sheet import SCRIPT_VERSION, SheetClient, SheetError, new_key, row_marked_red, script_code
+from ..sheet import (SCRIPT_VERSION, SheetClient, SheetError, export_connection, import_connection, new_key,
+                     row_marked_red, script_code)
 from ..timecodes import fmt_time, format_cuts, parse
 
 MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac",
@@ -284,12 +285,25 @@ class SheetDialog(QDialog):
             "2. В таблице: Расширения → Apps Script. Удалите всё в редакторе, вставьте код, нажмите «Сохранить».<br>"
             "3. «Начать развёртывание» → «Новое развёртывание» → шестерёнка → «Веб-приложение»; "
             "запуск от имени: «Я», доступ: «Все» → «Начать развёртывание», разрешите доступ.<br>"
-            "4. Скопируйте «URL веб-приложения» в поле ниже и нажмите «Проверить связь».")
+            "4. Скопируйте «URL веб-приложения» в поле ниже и нажмите «Проверить связь».<br>"
+            "<b>Второй компьютер:</b> код в Apps Script не трогайте — иначе первый компьютер потеряет связь. "
+            "На первом нажмите «Скопировать подключение», перешлите себе эту строку, а здесь нажмите "
+            "«Вставить подключение».")
         steps.setWordWrap(True)
         form.addRow(steps)
+        codes = QHBoxLayout()
         b_code = QPushButton("Скопировать код для Google")
         b_code.clicked.connect(self._copy_code)
-        form.addRow(b_code)
+        b_export = QPushButton("Скопировать подключение")
+        b_export.setToolTip("Адрес и ключ одной строкой — для этой же таблицы на другом компьютере. Это как пароль: "
+                            "пересылайте только себе")
+        b_export.clicked.connect(self._export)
+        b_import = QPushButton("Вставить подключение")
+        b_import.clicked.connect(self._import)
+        for b in (b_code, b_export, b_import):
+            codes.addWidget(b)
+        codes.addStretch(1)
+        form.addRow(codes)
         self.url = QLineEdit(self.cfg.get("url", ""))
         self.url.setPlaceholderText("https://script.google.com/macros/s/…/exec")
         form.addRow("URL веб-приложения", self.url)
@@ -333,6 +347,28 @@ class SheetDialog(QDialog):
     def _copy_code(self):
         QGuiApplication.clipboard().setText(script_code(self.cfg["key"]))
         self.ping_result.setText("Код скопирован — вставьте его в Apps Script.")
+
+    def _export(self):
+        if not self.url.text().strip():
+            self.ping_result.setText("<span style='color:#c62828'>Сначала подключите таблицу на этом компьютере.</span>")
+            return
+        QGuiApplication.clipboard().setText(export_connection(self.values()))
+        self.ping_result.setText("Подключение скопировано. Перешлите эту строку себе на другой компьютер и там нажмите "
+                                 "«Таблица…» → «Вставить подключение».")
+
+    def _import(self):
+        try:
+            got = import_connection(QGuiApplication.clipboard().text())
+        except ValueError as e:
+            self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
+            return
+        self.cfg.update(got)
+        self.url.setText(got["url"])
+        for field, w in (("sheet", self.sheet), ("link_col", self.link_col), ("cuts_col", self.cuts_col),
+                         ("note_col", self.note_col)):
+            if field in got:
+                w.setText(got[field])
+        self.ping_result.setText("Подключение вставлено — нажмите «Проверить связь», затем OK.")
 
     def _ping(self):
         QGuiApplication.setOverrideCursor(Qt.WaitCursor)
