@@ -396,7 +396,6 @@ def test_the_same_file_twice_in_the_list_becomes_one(tmp_path, monkeypatch):
     import json
     app = QApplication.instance() or QApplication([])
     fresh_app_state()
-    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
     from vidaudcont.gui.main_window import MainWindow
     f = tmp_path / "видео.m4a"
     shutil.copy(resources.asset("selftest.m4a"), f)
@@ -418,6 +417,8 @@ def test_the_same_file_twice_in_the_list_becomes_one(tmp_path, monkeypatch):
     w._write_session()
     saved = json.load(open(session, encoding="utf-8"))
     assert sorted(os.path.basename(d["path"]) for d in saved) == ["видео.m4a", "позже.m4a"]
+    wait(app, lambda: any(isinstance(c, QMessageBox) and c.isVisible() for c in w.children()), timeout=10)
+    app.processEvents()               # the notice about missing files is shown without stopping the program
     w.close()
 
 

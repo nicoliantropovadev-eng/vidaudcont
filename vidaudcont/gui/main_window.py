@@ -1793,10 +1793,12 @@ class MainWindow(QMainWindow):
         log_event(f"список файлов восстановлен: {len(self.items)}, нет на диске: {len(self._missing)}")
         if self._missing:
             names = "\n".join(os.path.basename(d.get("path", "")) for d in self._missing[:5])
-            QTimer.singleShot(500, lambda: QMessageBox.information(
-                self, "Список файлов", f"Файлов из списка нет на прежнем месте: {len(self._missing)}\n{names}"
-                + ("\n…" if len(self._missing) > 5 else "") + "\n\nОни перемещены, удалены или диск не подключён. "
-                "Их результаты сохранены: верните файлы на место и перезапустите программу."))
+            box = QMessageBox(QMessageBox.Information, "Список файлов",
+                              f"Файлов из списка нет на прежнем месте: {len(self._missing)}\n{names}"
+                              + ("\n…" if len(self._missing) > 5 else "") + "\n\nОни перемещены, удалены или диск не "
+                              "подключён. Их результаты сохранены: верните файлы на место и перезапустите программу.",
+                              parent=self)
+            QTimer.singleShot(500, box.open)  # after the window shows up; open() does not stop the program meanwhile
 
     def closeEvent(self, ev):
         self._write_session()
