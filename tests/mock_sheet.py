@@ -15,7 +15,7 @@ class MockSheet:
         self.pending = {}
         self.writes = []
         self.colors = {}  # row -> {"bg": [...], "fg": "#…"}, as the connector reports them
-        self.version = 2
+        self.version = 3
         self.requests = 0
         self.fail_gets = self.fail_posts = 0  # answer that many next requests with Google's 404 page
         server = self
@@ -113,4 +113,33 @@ class MockSheet:
                 if u.get("note") is not None:
                     self.set(int(u["row"]), note, u["note"], sheet)
             return {"ok": True, "written": len(p.get("updates", []))}
+        if p.get("action") == "append_texts" and self.version >= 3:  # the script's rules, in short
+            grid = self.sheets[sheet]
+            row_of = {}
+            for i, line in enumerate(grid, start=1):
+                m = re.search(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]{11})", (line or [""])[0] if line else "")
+                if m and m.group(1) not in row_of:
+                    row_of[m.group(1)] = i
+            last = max([i for i, line in enumerate(grid, start=1) if any(line)] or [0])
+            nxt = last + 1
+            if last == 0:
+                self.set(1, 1, "Ссылка", sheet)
+                self.set(1, 2, "Расшифровка", sheet)
+                nxt = 2
+            rows = []
+            for u in p.get("updates", []):
+                row = row_of.get(u["id"])
+                if not row:
+                    row, nxt = nxt, nxt + 1
+                    row_of[u["id"]] = row
+                for c, v in enumerate([u["link"]] + list(u.get("parts", [])), start=1):
+                    self.set(row, c, v, sheet)
+                rows.append(row)
+            return {"ok": True, "written": len(rows), "rows": rows}
+        if p.get("action") == "compact" and self.version >= 3:
+            grid = self.sheets[sheet]
+            kept = [line for line in grid if any(line)]
+            removed = len(grid) - len(kept)
+            grid[:] = kept
+            return {"ok": True, "rows": len(kept), "removed": removed}
         return {"ok": False, "error": "unknown action"}

@@ -12,7 +12,12 @@ function cell(r, c) { return (grid[r - 1] || [])[c - 1] || ""; }
 
 const sheet = {
   getName: () => "Sheet1",
-  getLastRow: () => grid.length,
+  getLastRow: () => {
+    let n = grid.length;
+    while (n > 0 && !(grid[n - 1] || []).some((v) => String(v) !== "")) n--;
+    return n;
+  },
+  getLastColumn: () => Math.max(0, ...grid.map((r) => r.length)),
   getRange: (row, col, nrows, ncols) => ({
     getDisplayValues: () => {
       const out = [];
@@ -40,6 +45,27 @@ const sheet = {
         out.push(line);
       }
       return out;
+    },
+    getValues: () => {
+      const out = [];
+      for (let r = 0; r < (nrows || 1); r++) {
+        const line = [];
+        for (let c = 0; c < (ncols || 1); c++) line.push(cell(row + r, col + c));
+        out.push(line);
+      }
+      return out;
+    },
+    setValues: (vals) => vals.forEach((line, r) => line.forEach((v, c) => {
+      while (grid.length < row + r) grid.push([]);
+      const g = grid[row + r - 1];
+      while (g.length < col + c) g.push("");
+      g[col + c - 1] = v;
+    })),
+    clearContent: () => {
+      for (let r = 0; r < (nrows || 1); r++) for (let c = 0; c < (ncols || 1); c++) {
+        const g = grid[row + r - 1];
+        if (g && g.length >= col + c) g[col + c - 1] = "";
+      }
     },
     setNumberFormat: (f) => { formats[`${row},${col}`] = f; },
     setValue: (v) => {

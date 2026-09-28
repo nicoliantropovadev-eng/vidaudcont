@@ -30,7 +30,9 @@ class SheetError(RuntimeError):
         self.transient = transient
 
 
-SCRIPT_VERSION = 2  # the connector that reports row colours
+COLORS_VERSION = 2  # the connector that reports row colours (rows marked red)
+TEXTS_VERSION = 3   # ...and puts transcripts one after another
+SCRIPT_VERSION = 3  # the latest connector
 CONNECTION_PREFIX = "VIDAUDCONT-CONNECTION:"
 CONNECTION_FIELDS = ("url", "key", "sheet", "link_col", "cuts_col", "note_col")
 
@@ -171,6 +173,17 @@ class SheetClient:
         data = self._call({"action": "rows"})
         self.version = data.get("version", 1)
         return data["rows"]
+
+    def append_texts(self, updates, batch=10):
+        """updates: [{id, link, parts}] -> one row per video on this sheet, one after another (script 3)."""
+        n = 0
+        for i in range(0, len(updates), batch):  # a batch of long texts stays well under the size of one request
+            n += self._call({"action": "append_texts", "updates": updates[i:i + batch]}, post=True)["written"]
+        return n
+
+    def compact(self):
+        """Empty rows of this sheet removed, the rest kept in its order (script 3)."""
+        return self._call({"action": "compact"}, post=True)
 
     def write(self, updates, batch=100):
         """updates: [{row, cuts?, note?}] -> number written."""

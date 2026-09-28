@@ -1,5 +1,6 @@
 """Main window: file list, analysis results with editable timecodes, separate lossless "Cut" button."""
 import csv
+import hashlib
 import json
 import os
 import queue
@@ -25,8 +26,8 @@ from ..downloads import (FolderWatcher, clean_link, first_rows, norm_path, parse
                          select_text_links, write_links)
 from .. import naming
 from ..matching import TitleCache, match_files
-from ..sheet import (SCRIPT_VERSION, SheetClient, SheetError, export_connection, import_connection, new_key,
-                     row_marked_red, script_code)
+from ..sheet import (COLORS_VERSION, SCRIPT_VERSION, TEXTS_VERSION, SheetClient, SheetError, export_connection,
+                     import_connection, new_key, row_marked_red, script_code)
 from ..timecodes import fmt_time, format_cuts, parse
 
 MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac",
@@ -140,9 +141,15 @@ class Worker(QThread):
                 elif kind == "text_rows":
                     res = {"rows": SheetClient.from_config(payload["cfg"], retries=2,
                                                            cancelled=self.cancel_flag.is_set).rows()}
-                elif kind == "texts":  # transcripts into their own sheet: A = link, B = text, same row numbers
-                    SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
+                elif kind == "texts":  # transcripts into their own sheet: A = link, B = text
+                    client = SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set)
+                    if payload.get("append"):
+                        client.append_texts(payload["append"])
+                    else:
+                        client.write(payload["updates"])
                     res = {"fids": payload["fids"]}
+                elif kind == "compact":
+                    res = SheetClient.from_config(payload["cfg"], retries=2, cancelled=self.cancel_flag.is_set).compact()
                 elif kind == "rows":
                     client = SheetClient.from_config(payload["cfg"], retries=2, cancelled=self.cancel_flag.is_set)
                     res = {"rows": client.rows(), "version": client.version}
@@ -300,6 +307,7 @@ class SettingsDialog(QDialog):
 
 class SheetDialog(QDialog):
     """Connection to the Google Sheet (Apps Script web app) and what to write there."""
+    pinged = Signal(str)
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
@@ -370,6 +378,8 @@ class SheetDialog(QDialog):
         row = QHBoxLayout()
         b_ping = QPushButton("Проверить связь")
         b_ping.clicked.connect(self._ping)
+        self.b_ping = b_ping
+        self.pinged.connect(self._on_pinged)
         row.addWidget(b_ping)
         self.ping_result = QLabel("")
         self.ping_result.setWordWrap(True)
@@ -407,28 +417,41 @@ class SheetDialog(QDialog):
         self.ping_result.setText("Подключение вставлено — нажмите «Проверить связь», затем OK.")
 
     def _ping(self):
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            d = SheetClient.from_config(self.values(), retries=1, timeout=30).ping()
-            self.ping_result.setText(f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», "
-                                     f"лист «{d['sheet']}», строк: {d['last_row']}</span>" + (
-                "" if d.get("version", 1) >= SCRIPT_VERSION else
-                "<br><span style='color:#c62828'>Код скрипта в таблице старый: программа не видит строки, отмеченные "
-                "красным. Скопируйте код заново, замените его в Apps Script, сохраните, затем «Начать развёртывание» → "
-                "«Управление развёртываниями» → карандаш → Версия: «Новая версия» → «Развернуть».</span>"))
-            text_sheet = self.text_sheet.text().strip()
-            if text_sheet:
-                try:
-                    SheetClient.from_config(dict(self.values(), sheet=text_sheet), retries=1, timeout=30).ping()
-                    self.ping_result.setText(self.ping_result.text() + f"<br>✓ Лист для расшифровок «{text_sheet}» есть.")
-                except SheetError as e:
-                    self.ping_result.setText(self.ping_result.text() + f"<br><span style='color:#c62828'>Лист для "
-                                             f"расшифровок «{text_sheet}»: {e}. Создайте его в таблице (имя — точь-в-точь)."
-                                             "</span>")
-        except (SheetError, ValueError) as e:
-            self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
-        finally:
-            QGuiApplication.restoreOverrideCursor()
+        """Checked in a background thread: the window stays usable however long Google takes."""
+        cfg, text_sheet = self.values(), self.text_sheet.text().strip()
+        self.b_ping.setEnabled(False)
+        self.ping_result.setText("Проверяю связь…")
+
+        def check():
+            try:
+                d = SheetClient.from_config(cfg, retries=1, timeout=30).ping()
+                out = (f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», лист «{d['sheet']}», "
+                       f"строк: {d['last_row']}</span>")
+                if d.get("version", 1) < SCRIPT_VERSION:
+                    out += ("<br><span style='color:#c62828'>Код скрипта в таблице старый" +
+                            (": программа не видит строки, отмеченные красным" if d.get("version", 1) < COLORS_VERSION
+                             else ": расшифровки пишутся не подряд") +
+                            ". Скопируйте код заново, замените его в Apps Script, сохраните, затем «Начать "
+                            "развёртывание» → «Управление развёртываниями» → карандаш → Версия: «Новая версия» → "
+                            "«Развернуть».</span>")
+                if text_sheet:
+                    try:
+                        SheetClient.from_config(dict(cfg, sheet=text_sheet), retries=1, timeout=30).ping()
+                        out += f"<br>✓ Лист для расшифровок «{text_sheet}» есть."
+                    except SheetError as e:
+                        out += (f"<br><span style='color:#c62828'>Лист для расшифровок «{text_sheet}»: {e}. Создайте "
+                                "его в таблице (имя — точь-в-точь).</span>")
+            except (SheetError, ValueError) as e:
+                out = f"<span style='color:#c62828'>{e}</span>"
+            try:
+                self.pinged.emit(out)
+            except RuntimeError:  # the dialog was closed meanwhile
+                pass
+        threading.Thread(target=check, daemon=True, name="ping").start()
+
+    def _on_pinged(self, text):
+        self.ping_result.setText(text)
+        self.b_ping.setEnabled(True)
 
     def values(self):
         return dict(self.cfg, url=self.url.text().strip(), sheet=self.sheet.text().strip(),
@@ -562,7 +585,7 @@ class DownloaderDialog(QDialog):
         self.mark_repeats.setChecked(bool(n_rep))
         self.mark_repeats.setEnabled(bool(n_rep))
         form.addRow(self.mark_repeats)
-        if rows and script_version < SCRIPT_VERSION:
+        if rows and script_version < COLORS_VERSION:
             old = QLabel("<span style='color:#c62828'><b>Код скрипта в таблице старый:</b> программа не видит строки, "
                          "отмеченные красным.</span> Обновите его: «Таблица…» → «Скопировать код для Google» → в Apps Script "
                          "замените код и сохраните → «Начать развёртывание» → «Управление развёртываниями» → карандаш → "
@@ -694,6 +717,14 @@ class TranscriptionDialog(QDialog):
         self.links_box.setReadOnly(True)
         self.links_box.setPlaceholderText("Здесь будут ссылки на видео, файлов которых нет")
         form.addRow(self.links_box)
+        gather = QHBoxLayout()
+        b_compact = QPushButton("Собрать расшифровки подряд")
+        b_compact.setToolTip("Убрать пустые строки между расшифровками на листе (остальное остаётся как есть и по порядку)")
+        b_compact.clicked.connect(self._compact)
+        gather.addWidget(b_compact)
+        self.compact_result = QLabel("")
+        gather.addWidget(self.compact_result, 1)
+        form.addRow(gather)
         buttons = QHBoxLayout()
         b_copy = QPushButton("Скопировать ссылки на недостающие")
         b_copy.clicked.connect(self._copy)
@@ -774,6 +805,13 @@ class TranscriptionDialog(QDialog):
         if path:
             write_links(path, links)
 
+    def _compact(self):
+        self.compact_result.setText("Собираю…")
+        self.window.compact_texts()
+
+    def compacted(self, msg):
+        self.compact_result.setText(msg)
+
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Папка для скачиваемых видео", self.folder.text())
         if d:
@@ -838,7 +876,7 @@ class MainWindow(QMainWindow):
         # new files from the downloads folder: "analyze" (the usual), "text" (transcribe only) or "add"
         self.watch_action = self.qs.value("watch_action", "") or \
             ("analyze" if self.qs.value("auto_analyze", "true") == "true" else "add")
-        self.text_done_rows = set()  # rows of the transcripts sheet that have a text, as last read
+        self.text_done_rows = set()  # videos (ids) with a link on the transcripts sheet, as last read
         self.text_spec = self.qs.value("text_rows", "") or ""  # rows chosen for transcripts ("" = every row)
         self.text_dir = self.qs.value("text_dir", "") or ""     # videos downloaded only for their transcripts
         self.text_watching = self.qs.value("text_watching", "false") == "true"
@@ -1433,6 +1471,19 @@ class MainWindow(QMainWindow):
                 and self.sheet_rows.get(it["row"])][:TEXTS_PER_WRITE]
         if not todo:
             return
+        if (self.sheet_version or 0) >= TEXTS_VERSION:  # one after another, one row per video: see the script
+            updates = []
+            for fid in todo:
+                it = self.items[fid]
+                vid = self.sheet_rows[it["row"]]["id"]
+                text = it["full_text"] or "(речи не найдено)"
+                updates.append({"id": vid, "link": clean_link(vid),  # about 50 minutes of speech per cell: then C, D…
+                                "parts": [text[i:i + CELL_MAX] for i in range(0, len(text), CELL_MAX)]})
+            self._texts_in_flight = set(todo)
+            self.net.add(0, "texts", {"cfg": cfg, "append": updates, "fids": todo})
+            self.progress.setVisible(True)
+            return
+        # an older script in the table: the text goes to the row of the video's link in the main sheet
         rows_of = {}  # a video standing in several rows gets its text in each of them
         for r in self.sheet_rows.values():
             rows_of.setdefault(r["id"], []).append(r["row"])
@@ -1681,7 +1732,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Расшифровка", "Сначала создайте в таблице лист для расшифровок и впишите его "
                                     "имя в «Таблица…» → «Лист для расшифровок».")
             return
-        self._after_fresh_rows(lambda: self._after_text_rows(self._show_transcription))
+        self._after_fresh_rows(lambda: self._after_text_rows(self._show_transcription))  # also learns the version
 
     def _show_transcription(self):
         folder = self.text_dir or (os.path.join(self.watch_dir, "для расшифровки") if self.watch_dir else "")
@@ -1716,6 +1767,16 @@ class MainWindow(QMainWindow):
     def _have_ids(self):
         return {self.sheet_rows[it["row"]]["id"] for it in self.items.values()
                 if it.get("row") in self.sheet_rows and "повтор" not in (it.get("skip") or "")}
+
+    def compact_texts(self):
+        if (self.sheet_version or 0) < TEXTS_VERSION:
+            msg = ("Для этого нужен новый код скрипта в таблице: «Таблица…» → «Скопировать код для Google» → замените код "
+                   "в Apps Script → «Управление развёртываниями» → «Новая версия».")
+            if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
+                self._downloader_dialog.compacted(msg)
+            return
+        self.net.add(0, "compact", {"cfg": self._text_cfg()})
+        self.progress.setVisible(True)
 
     def add_text_files(self, folder):
         """Files already downloaded, for the transcripts only. Returns how many were new to the list."""
@@ -2080,8 +2141,15 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "compact":
+            msg = f"Готово: расшифровок и других строк {res.get('rows', 0)}, пустых строк убрано {res.get('removed', 0)}."
+            if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
+                self._downloader_dialog.compacted(msg)
+            self.status_text.setText(msg)
+            self._maybe_idle(keep_text=True)
+            return
         if kind == "text_rows":
-            self.text_done_rows = {r["row"] for r in res["rows"]}
+            self.text_done_rows = {r["id"] for r in res["rows"]}  # videos with a text, wherever their row is
             then, self._text_rows_then = self._text_rows_then, None
             self._maybe_idle(keep_text=True)
             if then:
@@ -2098,6 +2166,7 @@ class MainWindow(QMainWindow):
             if it:
                 it["full_text"], it["text_written"] = res["text"], False
                 it.pop("text_progress", None)
+                self._store_text(it)
                 if it.get("text_only") and it["result"] is None:
                     it["status"] = "расшифровано"
                 self._refresh_row(fid)
@@ -2197,6 +2266,11 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind == "compact":
+            if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
+                self._downloader_dialog.compacted(f"Не получилось: {msg.splitlines()[0]}")
+            self._maybe_idle()
+            return
         if kind == "text_rows":
             self._text_rows_then = None
             if msg != "остановлено":
@@ -2302,6 +2376,20 @@ class MainWindow(QMainWindow):
                             it["cut"]["output"] if it.get("cut") else "", it["path"]])
         self.status_text.setText(f"Сохранено: {path}")
 
+    def _text_file(self, path):
+        d = os.path.join(app_data_dir(), "texts")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, hashlib.sha1(norm_path(path).encode("utf-8")).hexdigest()[:20] + ".txt")
+
+    def _store_text(self, it):
+        """The transcript goes to its own file once; the saved list only says there is one."""
+        try:
+            with open(self._text_file(it["path"]), "w", encoding="utf-8") as f:
+                f.write(it["full_text"])
+            it["_text_stored"] = True
+        except OSError as e:
+            log_event(f"не удалось сохранить расшифровку: {e!r}")
+
     def _seen_file(self):
         return os.path.join(app_data_dir(), "seen_files.json")
 
@@ -2378,9 +2466,12 @@ class MainWindow(QMainWindow):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
-                         "skip": it.get("skip"), "full_text": it.get("full_text"),
+                         "skip": it.get("skip"), "has_text": it.get("full_text") is not None,
                          "text_written": it.get("text_written", False), "text_only": it.get("text_only", False)})
         self._write_seen()
+        for it in self.items.values():  # transcripts not in their own file yet (e.g. from version 1.6)
+            if it.get("full_text") is not None and not it.get("_text_stored"):
+                self._store_text(it)
         present = {norm_path(it["path"]) for it in self.items.values()}
         self._missing = [d for d in self._missing if norm_path(d.get("path", "")) not in present]  # it came back
         data += self._missing
@@ -2423,6 +2514,12 @@ class MainWindow(QMainWindow):
         for d in data:
             if not isinstance(d, dict) or not d.get("path") or best.get(norm_path(d["path"])) is not d:
                 continue
+            if d.get("has_text") and d.get("full_text") is None:  # the transcript is in its own file
+                try:
+                    with open(self._text_file(d["path"]), encoding="utf-8") as f:
+                        d["full_text"] = f.read()
+                except OSError:  # lost: it is made again
+                    d["text_written"] = False
             if str(d.get("status") or "").startswith("расшифровка"):  # left there by version 1.6.0
                 d["status"] = self._proper_status(d)
             if not os.path.exists(d["path"]):

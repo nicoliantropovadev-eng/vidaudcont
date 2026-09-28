@@ -133,6 +133,9 @@ def match_files(paths, rows, titles, lang="ru"):
     exact = {}
     for k, row, _ in keys:
         exact.setdefault(k, []).append(row)
+    first = {}
+    for _, row, vid in keys:
+        first[vid] = min(row, first.get(vid, row))
 
     result = {}
     for p in paths:
@@ -141,7 +144,7 @@ def match_files(paths, rows, titles, lang="ru"):
         if ids:
             result[p] = (by_id[ids[0]]["row"], "id в имени")
             continue
-        row, how = _by_title(file_keys(p), keys, exact)
+        row, how = _by_title(file_keys(p), keys, exact, first)
         m = ROW_ONLY_RE.fullmatch(base)
         if row is None and m and int(m.group(1)) in by_row:  # "80.m4a", "80 (1).m4a": named after the row
             row, how = int(m.group(1)), "номер строки"
@@ -149,11 +152,13 @@ def match_files(paths, rows, titles, lang="ru"):
     return result
 
 
-def _by_title(fks, keys, exact):
+SIMILAR = 0.9       # a name this close to exactly one title (by difflib's ratio) is that title...
+SIMILAR_GAP = 0.03  # ...when no other video's title comes within this much
+FLOOR = SIMILAR - SIMILAR_GAP  # a score below this cannot change the answer: not worth computing exactly
+
+
+def _by_title(fks, keys, exact, first):
     """A video can stand in several rows: candidates are videos, the answer is the first row of that video."""
-    first = {}
-    for _, row, vid in keys:
-        first[vid] = min(row, first.get(vid, row))
     for fk in fks:
         if fk in exact:
             return min(exact[fk]), "название"
@@ -161,12 +166,24 @@ def _by_title(fks, keys, exact):
         pref = {vid for k, _, vid in keys if len(fk) >= 20 and k.startswith(fk)}
         if len(pref) == 1:
             return first[pref.pop()], "название"
-    best = []
+    best = {}  # video -> its best score, only where it can matter (>= FLOOR)
+    sm = difflib.SequenceMatcher(None)
     for fk in fks:
-        best += [(difflib.SequenceMatcher(None, fk, k).ratio(), vid) for k, _, vid in keys]
-    best.sort(reverse=True)
-    if best and best[0][0] >= 0.9:
-        runner_up = max((sc for sc, vid in best if vid != best[0][1]), default=0.0)
-        if best[0][0] - runner_up >= 0.03:
-            return first[best[0][1]], "похоже"
+        sm.set_seq2(fk)  # the file name is analysed once, the titles are compared against it
+        for k, _, vid in keys:
+            sm.set_seq1(k)
+            # cheap upper bounds first: most titles are far off in length or letters (100 names x 2000 titles
+            # took 11 s with ratio() alone, holding up the window)
+            if sm.real_quick_ratio() < FLOOR or sm.quick_ratio() < FLOOR:
+                continue
+            r = sm.ratio()
+            if r > best.get(vid, 0.0):
+                best[vid] = r
+    if not best:
+        return None, ""
+    ranked = sorted(best.items(), key=lambda x: -x[1])
+    top_vid, top = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    if top >= SIMILAR and top - runner_up >= SIMILAR_GAP:
+        return first[top_vid], "похоже"
     return None, ""

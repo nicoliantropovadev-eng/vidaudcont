@@ -12,7 +12,7 @@
  * Ключ ниже защищает таблицу: без него запросы отклоняются. Не публикуйте его.
  */
 const KEY = '__VIDAUDCONT_KEY__';
-const VERSION = 2;  // 2: row colours (rows marked red are skipped)
+const VERSION = 3;  // 2: row colours (rows marked red are skipped); 3: transcripts one after another
 
 function doGet(e) {
   return handle_(e && e.parameter ? e.parameter : {});
@@ -80,11 +80,59 @@ function handle_(p) {
       SpreadsheetApp.flush();
       return out_({ok: true, written: updates.length});
     }
+    if (p.action === 'append_texts') {
+      // one row per video, one after another: a video already on the sheet gets its own row updated
+      const last = sh.getLastRow();
+      const rowOf = {};
+      if (last > 0) {
+        const a = sh.getRange(1, 1, last, 1).getDisplayValues();
+        for (let i = 0; i < a.length; i++) {
+          const m = LINK_RE.exec(String(a[i][0] || ''));
+          if (m && !(m[1] in rowOf)) rowOf[m[1]] = i + 1;
+        }
+      }
+      let next = last + 1;
+      if (last === 0) {
+        sh.getRange(1, 1, 1, 2).setValues([['Ссылка', 'Расшифровка']]);
+        next = 2;
+      }
+      const rows = [];
+      (p.updates || []).forEach(function (u) {
+        const cells = [String(u.link)].concat((u.parts || []).map(String));
+        let row = rowOf[u.id];
+        if (!row) {
+          row = next++;
+          rowOf[u.id] = row;
+        }
+        const r = sh.getRange(row, 1, 1, cells.length);
+        r.setNumberFormat('@');
+        r.setValues([cells]);
+        rows.push(row);
+      });
+      SpreadsheetApp.flush();
+      return out_({ok: true, written: rows.length, rows: rows});
+    }
+    if (p.action === 'compact') {
+      // empty rows removed, everything else kept in its order
+      const last = sh.getLastRow(), width = sh.getLastColumn();
+      if (last < 1 || width < 1) return out_({ok: true, rows: 0, removed: 0});
+      const vals = sh.getRange(1, 1, last, width).getValues();
+      const kept = vals.filter(function (r) { return r.join('').trim() !== ''; });
+      if (kept.length === last) return out_({ok: true, rows: kept.length, removed: 0});
+      const r = sh.getRange(1, 1, kept.length, width);
+      r.setNumberFormat('@');
+      r.setValues(kept);
+      sh.getRange(kept.length + 1, 1, last - kept.length, width).clearContent();
+      SpreadsheetApp.flush();
+      return out_({ok: true, rows: kept.length, removed: last - kept.length});
+    }
     return out_({ok: false, error: 'unknown action: ' + p.action});
   } finally {
     lock.releaseLock();
   }
 }
+
+const LINK_RE = /(?:[?&]v=|youtu\.be\/|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{11})/;
 
 function out_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);

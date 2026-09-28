@@ -466,6 +466,7 @@ def test_every_video_is_transcribed_into_its_own_sheet(tmp_path, monkeypatch):
             ["", "", "https://youtu.be/BBBBBBBBBB2", "", "НЕ РАЗГОВОР"]]
     texts = []
     sheet = MockSheet(grid, key="k", sheets={"Расшифровки": texts})
+    sheet.version = 2  # an older script in the table: texts go to the rows of the links
     try:
         from vidaudcont.gui.main_window import C_TEXT, MainWindow
         w = MainWindow()
@@ -602,7 +603,7 @@ def test_transcription_of_chosen_rows(tmp_path, monkeypatch):
         w = MainWindow()
         w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "text_sheet": "Расшифровки"}
         w._after_fresh_rows(lambda: w._after_text_rows(lambda: None))
-        wait(app, lambda: w.text_done_rows == {3} and w.net.pending == 0)
+        wait(app, lambda: w.text_done_rows == {"BBBBBBBBBB2"} and w.net.pending == 0)
         have = tmp_path / "старые файлы"
         have.mkdir()
         shutil.copy(resources.asset("selftest.m4a"), have / "Talk three.m4a")      # row 5 is at hand
@@ -634,9 +635,10 @@ def test_transcription_of_chosen_rows(tmp_path, monkeypatch):
         assert all(it["result"] is None for it in items.values())            # nothing analysed
         w._flush_texts()
         wait(app, lambda: all(it.get("text_written") for it in items.values()) and w.net.pending == 0, timeout=60)
-        text = sheet.cell(2, 2, "Расшифровки")
-        assert "carrot" in text.lower() and sheet.cell(4, 2, "Расшифровки") == text   # row 4 repeats row 2
-        assert sheet.cell(5, 2, "Расшифровки") and sheet.cell(6, 2, "Расшифровки") == ""  # 6 was not chosen
+        by_id = {(line or [""])[0][-11:]: line for line in texts if line}
+        assert set(by_id) == {"BBBBBBBBBB2", "AAAAAAAAAA1", "CCCCCCCCCC3"} | ({"Ссылка"} if "Ссылка" in by_id else set())
+        assert "carrot" in by_id["AAAAAAAAAA1"][1].lower() and by_id["CCCCCCCCCC3"][1]   # one row per video, one
+        assert "DDDDDDDDDD4" not in by_id                                                # after another; 6 not chosen
         w.close()
     finally:
         sheet.close()
@@ -667,3 +669,49 @@ def test_statuses_left_by_a_transcription_are_put_right(tmp_path):
     by = {os.path.basename(it["path"]): it["status"] for it in w.items.values()}
     assert by == {"вырезан.m4a": "вырезано ✓, в таблице ✓", "готов.m4a": "готово", "только текст.m4a": "расшифровано"}
     w.close()
+
+
+@pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
+def test_transcripts_go_one_after_another(tmp_path, monkeypatch):
+    """With the new script, transcripts fill the sheet one after another (a video once, whatever its rows), empty
+    rows can be gathered away, and texts are kept in files of their own (the saved list stays small)."""
+    import json
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    grid = [["", "", "Link", "", ""]] + [["", "", f"https://youtu.be/{v}", "", ""]
+                                        for v in ("AAAAAAAAAA1", "BBBBBBBBBB2", "AAAAAAAAAA1")]
+    texts = [["Ссылка", "Расшифровка"], [], ["https://www.youtube.com/watch?v=CCCCCCCCCC3", "старая"], []]
+    sheet = MockSheet(grid, key="k", sheets={"Расшифровки": texts})
+    try:
+        from vidaudcont.gui.main_window import MainWindow
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "text_sheet": "Расшифровки"}
+        w._after_fresh_rows(lambda: None)
+        wait(app, lambda: w.sheet_version == 3 and w.net.pending == 0)
+        fids = []
+        for name, row in (("один.m4a", 2), ("два.m4a", 3)):
+            shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
+            fids.append(w._add_item(str(tmp_path / name), {"row": row, "status": "готово"}))
+        w._check_texts()
+        wait(app, lambda: not w._text_pending, timeout=300)
+        w._flush_texts()
+        wait(app, lambda: all(w.items[f].get("text_written") for f in fids) and w.net.pending == 0, timeout=60)
+        links = [(line or [""])[0] for line in texts]
+        assert links[:3] == ["Ссылка", "", "https://www.youtube.com/watch?v=CCCCCCCCCC3"]
+        assert links[3:5] == ["https://www.youtube.com/watch?v=AAAAAAAAAA1", "https://www.youtube.com/watch?v=BBBBBBBBBB2"]
+        assert "carrot" in texts[3][1].lower() and len(texts) == 5         # row 4 of the main sheet: no second copy
+        w.compact_texts()
+        wait(app, lambda: w.net.pending == 0)
+        assert [(line or [""])[0][-11:] for line in texts] == ["Ссылка", "CCCCCCCCCC3", "AAAAAAAAAA1", "BBBBBBBBBB2"]
+        w._write_session()
+        saved = json.load(open(w._session_file(), encoding="utf-8"))
+        assert all(d.get("full_text") is None and d["has_text"] for d in saved)   # not in the list...
+        w.close()
+        w2 = MainWindow()                                                         # ...but back after a restart
+        assert all("carrot" in it["full_text"].lower() for it in w2.items.values())
+        w2.close()
+    finally:
+        sheet.close()

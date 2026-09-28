@@ -101,7 +101,7 @@ def select_text_links(rows, wanted=None, done_rows=(), have_ids=(), skip_red=Tru
         if wanted is not None and not any(r["row"] in wanted for r in vrows):
             continue
         counts["videos"] += 1
-        if any(r["row"] in done_rows for r in vrows):
+        if vid in done_rows or any(r["row"] in done_rows for r in vrows):  # ids (or older: row numbers)
             counts["done"] += 1
         elif vid in have_ids:
             counts["have"] += 1
