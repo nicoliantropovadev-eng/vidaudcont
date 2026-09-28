@@ -74,6 +74,7 @@ jobs:
           python scripts/fetch_ffmpeg.py
 
       - name: Unit tests (lossless cutting in all formats, timecodes, window)
+        timeout-minutes: 25
         run: python -m pytest tests -q -p no:cacheprovider
 
       - name: Build

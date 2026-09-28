@@ -49,6 +49,11 @@ SETTING_LABELS = {
 }
 
 
+def clipboard():
+    """The system clipboard (a function of its own, so tests can use a stand-in: CI machines have no desktop)."""
+    return QGuiApplication.clipboard()
+
+
 def _plain(o):
     """For json: numbers from numpy and sets become plain numbers and lists; anything else becomes text."""
     if hasattr(o, "item"):
@@ -345,20 +350,20 @@ class SheetDialog(QDialog):
         form.addRow(bb)
 
     def _copy_code(self):
-        QGuiApplication.clipboard().setText(script_code(self.cfg["key"]))
+        clipboard().setText(script_code(self.cfg["key"]))
         self.ping_result.setText("Код скопирован — вставьте его в Apps Script.")
 
     def _export(self):
         if not self.url.text().strip():
             self.ping_result.setText("<span style='color:#c62828'>Сначала подключите таблицу на этом компьютере.</span>")
             return
-        QGuiApplication.clipboard().setText(export_connection(self.values()))
+        clipboard().setText(export_connection(self.values()))
         self.ping_result.setText("Подключение скопировано. Перешлите эту строку себе на другой компьютер и там нажмите "
                                  "«Таблица…» → «Вставить подключение».")
 
     def _import(self):
         try:
-            got = import_connection(QGuiApplication.clipboard().text())
+            got = import_connection(clipboard().text())
         except ValueError as e:
             self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
             return
@@ -493,7 +498,7 @@ class DownloaderDialog(QDialog):
             self.watch_dir.setText(d)
 
     def _copy(self):
-        QGuiApplication.clipboard().setText("\n".join(link for _, link in self.links()))
+        clipboard().setText("\n".join(link for _, link in self.links()))
         self.count.setText(self.count.text().split("  ")[0] + "  — скопированы")
 
     def _save(self):
@@ -660,7 +665,7 @@ class MainWindow(QMainWindow):
         self.tc_status = QLabel("")
         row.addWidget(self.tc_status, 1)
         b_copy = QPushButton("Копировать")
-        b_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.tc_edit.toPlainText().strip()))
+        b_copy.clicked.connect(lambda: clipboard().setText(self.tc_edit.toPlainText().strip()))
         row.addWidget(b_copy)
         b_reset = QPushButton("Вернуть найденные")
         b_reset.clicked.connect(self.reset_timecodes)

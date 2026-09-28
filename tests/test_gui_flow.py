@@ -421,11 +421,24 @@ def test_the_same_file_twice_in_the_list_becomes_one(tmp_path, monkeypatch):
     w.close()
 
 
-def test_sheet_dialog_copies_the_connection_to_another_computer():
-    app = QApplication.instance() or QApplication([])
-    from PySide6.QtGui import QGuiApplication
+class FakeClipboard:
+    """The real clipboard hangs on CI machines without a desktop."""
+    def __init__(self):
+        self.value = ""
 
+    def setText(self, text):
+        self.value = text
+
+    def text(self):
+        return self.value
+
+
+def test_sheet_dialog_copies_the_connection_to_another_computer(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    from vidaudcont.gui import main_window
     from vidaudcont.gui.main_window import SheetDialog
+    board = FakeClipboard()
+    monkeypatch.setattr(main_window, "clipboard", lambda: board)
     first = SheetDialog({"url": "https://script.google.com/macros/s/AKfy/exec", "key": "secret1", "cuts_col": "F"})
     first._export()
     second = SheetDialog({})                       # a new computer: its own new key...
@@ -433,7 +446,7 @@ def test_sheet_dialog_copies_the_connection_to_another_computer():
     second._import()                               # ...replaced by the one the script in the table knows
     v = second.values()
     assert (v["url"], v["key"], v["cuts_col"]) == ("https://script.google.com/macros/s/AKfy/exec", "secret1", "F")
-    QGuiApplication.clipboard().setText("что-то другое")
+    board.setText("что-то другое")
     second._import()
     assert "не подключение" in second.ping_result.text()
     app.processEvents()
