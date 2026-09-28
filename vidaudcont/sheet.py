@@ -3,8 +3,10 @@
 The script runs inside the user's spreadsheet under their Google account, so the program needs no
 Google Cloud project or sign-in: it only knows the web app URL and a shared key.
 """
+import colorsys
 import http.client
 import json
+import re
 import secrets
 import time
 import urllib.error
@@ -25,6 +27,23 @@ class SheetError(RuntimeError):
     def __init__(self, msg, transient=False):
         super().__init__(msg)
         self.transient = transient
+
+
+SCRIPT_VERSION = 2  # the connector that reports row colours
+
+
+def is_red(color):
+    """Red, dark or light red, red berry: a fill or text colour the user marks rows to skip with."""
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (color or "").strip())
+    if not m:
+        return False
+    r, g, b = (int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    return (h <= 20 / 360 or h >= 340 / 360) and s >= 0.15 and v >= 0.25
+
+
+def row_marked_red(row):
+    return any(is_red(c) for c in row.get("bg") or []) or is_red(row.get("fg"))
 
 
 def new_key():
@@ -55,6 +74,7 @@ class SheetClient:
             raise SheetError("не указан адрес веб-приложения (https://script.google.com/…/exec)")
         self.url, self.key, self.sheet, self.timeout = url.strip(), key, sheet.strip(), timeout
         self.retries, self.cancelled = retries, cancelled
+        self.version = None
         self.cols = {"link_col": col_number(link_col), "cuts_col": col_number(cuts_col),
                      "note_col": col_number(note_col)}
 
@@ -121,8 +141,11 @@ class SheetClient:
         return self._call({"action": "ping"})
 
     def rows(self):
-        """[{row, link, id, cuts, note}] for every row whose link column holds a YouTube link."""
-        return self._call({"action": "rows"})["rows"]
+        """[{row, link, id, cuts, note, bg, fg}] for every row whose link column holds a YouTube link.
+        self.version tells whether the script in the table reports row colours (2) or not (1)."""
+        data = self._call({"action": "rows"})
+        self.version = data.get("version", 1)
+        return data["rows"]
 
     def write(self, updates, batch=100):
         """updates: [{row, cuts?, note?}] -> number written."""

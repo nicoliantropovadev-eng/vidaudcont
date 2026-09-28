@@ -79,6 +79,7 @@ class AnalysisPool:
         self.lock = threading.Lock()
         self.pending = 0
         self.generation = 0  # raised by cancel_all: jobs queued before it are not analysed
+        self.skip = set()    # files no longer wanted (a red row, a second copy): dropped when their turn comes
         self.workers, self.threads = 1, 1
         self.slots = []
         self.closing = False
@@ -104,6 +105,11 @@ class AnalysisPool:
             self.pending += 1
             gen = self.generation
         self.jobs.put((fid, path, dict(settings), gen, kind, dict(extra or {})))
+
+    def drop(self, fid):
+        """Do not analyse this file when its turn comes (an analysis already running finishes)."""
+        with self.lock:
+            self.skip.add(fid)
 
     def cancel_all(self):
         """Drop the queue (returns the dropped ids) and stop the running analyses: they report "остановлено"."""
@@ -153,6 +159,9 @@ class _Slot(threading.Thread):
             try:
                 if gen != pool.generation:  # taken from the queue just as it was stopped
                     pool.on_failed(fid, kind, "остановлено")
+                elif fid in pool.skip:
+                    pool.skip.discard(fid)
+                    pool.on_failed(fid, kind, "пропущено")
                 else:
                     self._analyse(fid, path, settings, gen, kind, extra)
             except Exception:  # never lose the slot: report and go on

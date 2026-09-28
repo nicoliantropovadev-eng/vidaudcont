@@ -8,6 +8,7 @@ finishes downloading in the folder.
 import os
 
 from . import cutter
+from .sheet import row_marked_red
 
 MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac",
              ".ape", ".wv", ".amr", ".ac3", ".eac3", ".mka", ".caf", ".m4b", ".mp2", ".mp4", ".m4v", ".mov", ".mkv",
@@ -26,19 +27,42 @@ def clean_link(video_id):
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
-def select_links(rows, first, last, skip_filled=True, skip_rows=()):
-    """rows: [{row, id, cuts}] from the sheet -> [(row, link)] in table order, one per video."""
-    out, seen = [], set()
-    skip_rows = set(skip_rows)
+def first_rows(rows):
+    """video id -> the first row it appears in. Later rows with the same video are repeats."""
+    first = {}
     for r in sorted(rows, key=lambda r: r["row"]):
-        if not first <= r["row"] <= last or r["row"] in skip_rows:
+        first.setdefault(r["id"], r["row"])
+    return first
+
+
+def repeats(rows):
+    """{row: first row of the same video} for every repeated link in the whole table."""
+    first = first_rows(rows)
+    return {r["row"]: first[r["id"]] for r in rows if first[r["id"]] != r["row"]}
+
+
+def select_links(rows, first, last, skip_filled=True, skip_rows=(), stats=None):
+    """rows: [{row, id, cuts, note, bg, fg}] from the sheet -> [(row, link)] in table order, one per video.
+    Left out: rows marked red, repeats of a video from an earlier row anywhere in the table (even one already
+    done), rows with timecodes or a note. stats (a dict) receives how many were left out and why."""
+    out, rep = [], repeats(rows)
+    skip_rows = set(skip_rows)
+    counts = {"red": 0, "repeat": 0, "filled": 0, "have": 0}
+    for r in sorted(rows, key=lambda r: r["row"]):
+        if not first <= r["row"] <= last:
             continue
-        if skip_filled and ((r.get("cuts") or "").strip() or (r.get("note") or "").strip()):
-            continue  # done, or marked as not fitting / not downloadable
-        if r["id"] in seen:
-            continue
-        seen.add(r["id"])
-        out.append((r["row"], clean_link(r["id"])))
+        if row_marked_red(r):
+            counts["red"] += 1
+        elif r["row"] in rep:
+            counts["repeat"] += 1
+        elif skip_filled and ((r.get("cuts") or "").strip() or (r.get("note") or "").strip()):
+            counts["filled"] += 1  # done, or marked as not fitting / not downloadable
+        elif r["row"] in skip_rows:
+            counts["have"] += 1
+        else:
+            out.append((r["row"], clean_link(r["id"])))
+    if stats is not None:
+        stats.update(counts)
     return out
 
 

@@ -13,6 +13,8 @@ class MockSheet:
         self.key = key
         self.pending = {}
         self.writes = []
+        self.colors = {}  # row -> {"bg": [...], "fg": "#…"}, as the connector reports them
+        self.version = 2
         self.requests = 0
         self.fail_gets = self.fail_posts = 0  # answer that many next requests with Google's 404 page
         server = self
@@ -86,7 +88,7 @@ class MockSheet:
             return {"ok": False, "error": "wrong key"}
         link, cuts, note = int(p.get("link_col", 3)), int(p.get("cuts_col", 4)), int(p.get("note_col", 5))
         if p.get("action") == "ping":
-            return {"ok": True, "spreadsheet": "Mock", "sheet": "Sheet1", "last_row": len(self.grid)}
+            return {"ok": True, "version": self.version, "spreadsheet": "Mock", "sheet": "Sheet1", "last_row": len(self.grid)}
         if p.get("action") == "rows":
             rows = []
             for i in range(1, len(self.grid) + 1):
@@ -94,7 +96,9 @@ class MockSheet:
                 if m:
                     rows.append({"row": i, "link": self.cell(i, link), "id": m.group(1),
                                  "cuts": self.cell(i, cuts), "note": self.cell(i, note)})
-            return {"ok": True, "sheet": "Sheet1", "rows": rows}
+                    if self.version >= 2:
+                        rows[-1].update(self.colors.get(i, {"bg": [], "fg": "#000000"}))
+            return {"ok": True, "sheet": "Sheet1", "rows": rows} | ({"version": self.version} if self.version >= 2 else {})
         if p.get("action") == "write":
             for u in p.get("updates", []):
                 self.writes.append(u)

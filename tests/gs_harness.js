@@ -5,6 +5,7 @@ const vm = require("vm");
 
 const [, , gsPath, reqPath] = process.argv;
 const grid = JSON.parse(fs.readFileSync(reqPath, "utf8")).grid;  // array of rows (arrays of strings)
+const colors = JSON.parse(fs.readFileSync(reqPath, "utf8")).colors || {};  // "row,col" -> {bg, fg}
 const formats = {};
 
 function cell(r, c) { return (grid[r - 1] || [])[c - 1] || ""; }
@@ -18,6 +19,24 @@ const sheet = {
       for (let r = 0; r < (nrows || 1); r++) {
         const line = [];
         for (let c = 0; c < (ncols || 1); c++) line.push(String(cell(row + r, col + c)));
+        out.push(line);
+      }
+      return out;
+    },
+    getBackgrounds: () => {
+      const out = [];
+      for (let r = 0; r < (nrows || 1); r++) {
+        const line = [];
+        for (let c = 0; c < (ncols || 1); c++) line.push((colors[`${row + r},${col + c}`] || {}).bg || "#ffffff");
+        out.push(line);
+      }
+      return out;
+    },
+    getFontColors: () => {
+      const out = [];
+      for (let r = 0; r < (nrows || 1); r++) {
+        const line = [];
+        for (let c = 0; c < (ncols || 1); c++) line.push((colors[`${row + r},${col + c}`] || {}).fg || "#000000");
         out.push(line);
       }
       return out;

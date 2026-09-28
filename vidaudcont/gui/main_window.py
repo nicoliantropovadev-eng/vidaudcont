@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -20,9 +21,9 @@ from .. import __version__, cutter
 from ..engine.analyzer import Settings, default_threads, suitability
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
-from ..downloads import FolderWatcher, norm_path, select_links, write_links
+from ..downloads import FolderWatcher, first_rows, norm_path, repeats, select_links, write_links
 from ..matching import TitleCache, match_files
-from ..sheet import SheetClient, SheetError, new_key, script_code
+from ..sheet import SCRIPT_VERSION, SheetClient, SheetError, new_key, row_marked_red, script_code
 from ..timecodes import fmt_time, format_cuts, parse
 
 MEDIA_EXT = {".m4a", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac",
@@ -112,8 +113,8 @@ class Worker(QThread):
                 if kind == "match":
                     res = self._match(payload, report)
                 elif kind == "rows":
-                    res = {"rows": SheetClient.from_config(payload["cfg"], retries=2,
-                                                           cancelled=self.cancel_flag.is_set).rows()}
+                    client = SheetClient.from_config(payload["cfg"], retries=2, cancelled=self.cancel_flag.is_set)
+                    res = {"rows": client.rows(), "version": client.version}
                 elif kind == "sheet":
                     SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
                     res = {"sheet": "записано", "updates": payload["updates"], "fids": payload.get("fids", []),
@@ -131,11 +132,13 @@ class Worker(QThread):
 
     def _match(self, payload, report):
         report(0.02, "читаю таблицу")
-        rows = SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).rows()
+        client = SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set)
+        rows = client.rows()
         cache = TitleCache(payload["cache_path"])
         cache.fetch([r["id"] for r in rows], lang=payload["lang"], cancelled=self.cancel_flag.is_set,
                     progress=lambda f, t: report(0.05 + 0.9 * f, t))
-        return {"rows": rows, "matches": match_files(payload["paths"], rows, cache.data, lang=payload["lang"])}
+        return {"rows": rows, "version": client.version,
+                "matches": match_files(payload["paths"], rows, cache.data, lang=payload["lang"])}
 
     def _cut(self, payload, report):
         if payload["cuts"]:
@@ -336,7 +339,11 @@ class SheetDialog(QDialog):
         try:
             d = SheetClient.from_config(self.values(), retries=1, timeout=30).ping()
             self.ping_result.setText(f"<span style='color:#2e7d32'>✓ Связь есть: «{d['spreadsheet']}», "
-                                     f"лист «{d['sheet']}», строк: {d['last_row']}</span>")
+                                     f"лист «{d['sheet']}», строк: {d['last_row']}</span>" + (
+                "" if d.get("version", 1) >= SCRIPT_VERSION else
+                "<br><span style='color:#c62828'>Код скрипта в таблице старый: программа не видит строки, отмеченные "
+                "красным. Скопируйте код заново, замените его в Apps Script, сохраните, затем «Начать развёртывание» → "
+                "«Управление развёртываниями» → карандаш → Версия: «Новая версия» → «Развернуть».</span>"))
         except (SheetError, ValueError) as e:
             self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
         finally:
@@ -352,7 +359,7 @@ class SheetDialog(QDialog):
 class DownloaderDialog(QDialog):
     """Links for 4K Video Downloader+ and the folder the program watches for finished downloads."""
 
-    def __init__(self, rows, have_rows, watch_dir, watching, auto_analyze, parent=None):
+    def __init__(self, rows, have_rows, watch_dir, watching, auto_analyze, parent=None, script_version=SCRIPT_VERSION):
         super().__init__(parent)
         self.setWindowTitle("4K Video Downloader+")
         self.setMinimumWidth(660)
@@ -379,6 +386,19 @@ class DownloaderDialog(QDialog):
         for w in (self.skip_filled, self.skip_have):
             w.toggled.connect(self._update)
             form.addRow(w)
+        n_rep = sum(1 for r, _ in repeats(rows).items()
+                    if not any(x["row"] == r and ((x.get("note") or "").strip() or row_marked_red(x)) for x in rows))
+        self.mark_repeats = QCheckBox(f"пометить повторы в таблице: «ПОВТОР строки N» в колонке E ({n_rep})")
+        self.mark_repeats.setChecked(bool(n_rep))
+        self.mark_repeats.setEnabled(bool(n_rep))
+        form.addRow(self.mark_repeats)
+        if rows and script_version < SCRIPT_VERSION:
+            old = QLabel("<span style='color:#c62828'><b>Код скрипта в таблице старый:</b> программа не видит строки, "
+                         "отмеченные красным.</span> Обновите его: «Таблица…» → «Скопировать код для Google» → в Apps Script "
+                         "замените код и сохраните → «Начать развёртывание» → «Управление развёртываниями» → карандаш → "
+                         "Версия: «Новая версия» → «Развернуть». Адрес останется прежним.")
+            old.setWordWrap(True)
+            form.addRow(old)
         self.count = QLabel("")
         form.addRow("Ссылок", self.count)
         folder = QHBoxLayout()
@@ -418,13 +438,18 @@ class DownloaderDialog(QDialog):
         form.addRow(bb)
         self._update()
 
-    def links(self):
+    def links(self, stats=None):
         return select_links(self.rows, self.first.value(), self.last.value(), self.skip_filled.isChecked(),
-                            self.have_rows if self.skip_have.isChecked() else ())
+                            self.have_rows if self.skip_have.isChecked() else (), stats=stats)
 
     def _update(self):
-        n = len(self.links())
-        self.count.setText(f"{n}" + ("  (ничего не выбрано — проверьте диапазон и галочки)" if not n else ""))
+        stats = {}
+        n = len(self.links(stats))
+        left = [f"{k} — {stats[v]}" for k, v in (("красных", "red"), ("повторов", "repeat"),
+                                                   ("с таймкодами или пометкой", "filled"), ("уже в программе", "have"))
+                if stats.get(v)]
+        self.count.setText(f"{n}" + (f"   пропущено: {', '.join(left)}" if left else "")
+                           + ("  (ничего не выбрано — проверьте диапазон и галочки)" if not n else ""))
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, "Папка загрузок 4K Video Downloader+", self.watch_dir.text())
@@ -448,6 +473,14 @@ class DownloaderDialog(QDialog):
 
     def values(self):
         return self.watch_dir.text().strip(), self.watching.isChecked(), self.auto_analyze.isChecked()
+
+    def repeats_to_mark(self):
+        """Updates for column E of repeated videos not marked yet (and not red, which the user already marked)."""
+        if not self.mark_repeats.isChecked():
+            return []
+        by_row = {r["row"]: r for r in self.rows}
+        return [{"row": r, "note": f"ПОВТОР строки {first}"} for r, first in sorted(repeats(self.rows).items())
+                if not (by_row[r].get("note") or "").strip() and not row_marked_red(by_row[r])]
 
 
 COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Подходит", "Вырезано"]
@@ -491,6 +524,7 @@ class MainWindow(QMainWindow):
         self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
         self._dialogue_pending = set()  # files whose conversation check is queued
         self._rows_then = None  # what to do once the table has been read in the background
+        self.sheet_version = None  # version of the script in the table (2 = reports row colours)
         self.save_timer = QTimer(self)  # many changes in a row end up in one write of the file list
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(3000)
@@ -708,8 +742,8 @@ class MainWindow(QMainWindow):
         it = {"path": path, "status": "ожидает анализа", "result": None, "text": None, "cut": None,
               "row": None, "row_how": ""}
         if state:
-            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted")
-                       if k in state})
+            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted", "skip")
+                       if k in state and state.get(k) is not None})
         self.items[fid] = it
         self._loading = True
         r = self.table.rowCount()
@@ -772,14 +806,19 @@ class MainWindow(QMainWindow):
         t_item.setForeground(QColor("#2e7d32") if topic and topic.get("medical") else QColor("#ef6c00"))
         fit_item = self.table.item(r, C_FIT)
         why = suitability(res) if res else None
-        if why is None:
+        if it.get("skip"):
+            fit_item.setText("✗ пропуск: " + ("красная строка" if "красным" in it["skip"] else "повтор"))
+            fit_item.setForeground(QColor("#9e9e9e"))
+            fit_item.setToolTip("Пропускается: " + it["skip"])
+        elif why is None:
             fit_item.setText("проверяется…" if res and self.settings.dialogue else "")
             fit_item.setForeground(QColor("#607d8b"))
         else:
             fit_item.setText("✓ да" if not why else "✗ " + ", ".join(SHORT_WHY.get(w, w.lower()) for w in why))
             fit_item.setForeground(QColor("#2e7d32") if not why else QColor("#c62828"))
         d = (res or {}).get("dialogue") or {}
-        fit_item.setToolTip(("Не подходит: " + ", ".join(why) + "\n" if why else "") + (
+        if not it.get("skip"):
+            fit_item.setToolTip(("Не подходит: " + ", ".join(why) + "\n" if why else "") + (
             f"Голосов: {'два' if d.get('separation', 0) >= 0.15 else 'один'}, реплики сменяются {d['turns_per_min']} раз "
             f"в минуту речи" if "turns_per_min" in d else d.get("reason", "")))
         cut = it.get("cut")
@@ -988,6 +1027,8 @@ class MainWindow(QMainWindow):
 
     def _queue_analysis(self, fid):
         it = self.items[fid]
+        if it.get("skip"):
+            return
         it["status"] = "в очереди"
         self._refresh_row(fid)
         self.pool.add(fid, it["path"], asdict(self.settings))
@@ -999,7 +1040,8 @@ class MainWindow(QMainWindow):
             return
         for fid, it in self.items.items():
             res = it.get("result")
-            if res and "dialogue" not in res and res.get("segments") is not None and fid not in self._dialogue_pending:
+            if res and "dialogue" not in res and res.get("segments") is not None and fid not in self._dialogue_pending \
+                    and not it.get("skip"):
                 self._dialogue_pending.add(fid)
                 self.pool.add(fid, it["path"], asdict(self.settings), kind="dialogue",
                               extra={"segments": res["segments"]})
@@ -1082,6 +1124,7 @@ class MainWindow(QMainWindow):
 
     def _apply_matches(self, res):
         self.sheet_rows = {r["row"]: r for r in res["rows"]}
+        self.sheet_version = res.get("version")
         by_path = {it["path"]: fid for fid, it in self.items.items()}
         for path in res["matches"]:
             if path in by_path:
@@ -1095,11 +1138,58 @@ class MainWindow(QMainWindow):
             found += row is not None
             self._refresh_row(fid)
         missing = [os.path.basename(p) for p, (row, _) in res["matches"].items() if row is None]
+        skipped = self._mark_skips()
         self._save_session()
         msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
+        if skipped:
+            msg += f" Пропускаются (красная строка или повтор): {skipped}."
         if missing:
             msg += f" Не найдены: {len(missing)} — укажите номер вручную (двойной щелчок в колонке «Строка»)."
         self.status_text.setText(msg)
+
+    def _mark_skips(self):
+        """Files the table says to leave alone: their row is marked red, or another file is the same video
+        (a second download "… (1).m4a", or the same video in another row). Returns how many are skipped."""
+        if not self.sheet_rows:
+            return 0
+        first = first_rows(self.sheet_rows.values())
+
+        def rank(fid):  # the copy to keep: already cut, already analysed, not a "(1)" copy, added first
+            it = self.items[fid]
+            copy = bool(re.search(r" \(\d+\)$", os.path.splitext(os.path.basename(it["path"]))[0]))
+            return not it.get("cut"), it.get("result") is None, copy, fid
+
+        kept, skipped = {}, 0
+        for fid in sorted(self.items, key=rank):
+            it = self.items[fid]
+            info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
+            reason = None
+            if info is not None:
+                if row_marked_red(info) or row_marked_red(self.sheet_rows.get(first.get(info["id"]), {})):
+                    reason = "строка отмечена красным"
+                elif info["id"] in kept:
+                    reason = f"повтор файла {os.path.basename(self.items[kept[info['id']]]['path'])}"
+                else:
+                    kept[info["id"]] = fid
+            skipped += reason is not None
+            if reason == it.get("skip"):
+                continue
+            if reason:
+                it["skip"] = reason
+                if it["result"] is None:
+                    self.pool.drop(fid)
+                    it["status"] = "пропущен"
+            else:
+                it.pop("skip", None)
+                self.pool.skip.discard(fid)
+                if it["result"] is None and it["status"] == "пропущен":
+                    it["status"] = "ожидает анализа"
+                    if self.auto_analyze:
+                        self._queue_analysis(fid)
+            self._refresh_row(fid)
+            if fid == self.current:
+                self._show_details(fid)
+        return skipped
 
     def _pending_match_paths(self):
         return [it["path"] for it in self.items.values() if it.get("row") is None and it.get("row_how") != "вручную"
@@ -1115,8 +1205,13 @@ class MainWindow(QMainWindow):
     def _show_downloader(self):
         rows = list(self.sheet_rows.values()) if self.sheet_cfg.get("url") else []
         have = {it["row"] for it in self.items.values() if it.get("row")}
-        dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.auto_analyze, self)
+        dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.auto_analyze, self,
+                               script_version=self.sheet_version or SCRIPT_VERSION)
         if dlg.exec():
+            marks = dlg.repeats_to_mark()
+            if marks:
+                self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": marks})
+                self.progress.setVisible(True)
             self.watch_dir, self.watching, self.auto_analyze = dlg.values()
             self.qs.setValue("watch_dir", self.watch_dir)
             self.qs.setValue("watching", "true" if self.watching else "false")
@@ -1200,11 +1295,14 @@ class MainWindow(QMainWindow):
                 row[k] = upd[k]
 
     def cut_all(self):
-        todo, no_row, bad, unfit, unchecked = [], [], [], [], []
+        todo, no_row, bad, unfit, unchecked, skipped = [], [], [], [], [], []
         for r in range(self.table.rowCount()):
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             it = self.items[fid]
             if not it["result"] or (it.get("cut") and it["status"].startswith("вырезано")):
+                continue
+            if it.get("skip"):
+                skipped.append(os.path.basename(it["path"]))
                 continue
             try:
                 cuts, tc = self._cuts_for(it)
@@ -1252,6 +1350,8 @@ class MainWindow(QMainWindow):
         if unchecked:
             text += (f"\nЕщё проверяются, разговор ли это ({len(unchecked)}) — вырежутся при следующем нажатии, "
                      "если подойдут.\n")
+        if skipped:
+            text += f"\nПропускаются: строка отмечена красным или повтор ({len(skipped)}).\n"
         if bad:
             text += "\nПропущены из-за ошибок в таймкодах:\n  " + "\n  ".join(bad[:5]) + "\n"
         if unwritten:
@@ -1428,6 +1528,8 @@ class MainWindow(QMainWindow):
             return
         if kind == "rows":
             self.sheet_rows = {r["row"]: r for r in res["rows"]}
+            self.sheet_version = res.get("version")
+            self._mark_skips()
             then, self._rows_then = self._rows_then, None
             self._maybe_idle(keep_text=True)
             if then:
@@ -1485,6 +1587,11 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if msg == "пропущено":  # dropped from the queue: its row is red or it is a second copy
+            if fid in self.items:
+                self._refresh_row(fid)
+            self._maybe_idle()
+            return
         log_event(f"ошибка ({kind}): {msg}")
         if kind == "dialogue":  # a check in the background: the file keeps its analysis, no window for this
             self._dialogue_pending.discard(fid)
@@ -1573,11 +1680,12 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             it = self.items[self.table.item(r, C_FILE).data(Qt.UserRole)]
             st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
-                ("ошибка" if it["status"] == "ошибка" else "ожидает анализа")
+                (it["status"] if it["status"] in ("ошибка", "пропущен") else "ожидает анализа")
             if it["result"] and not st.startswith(("готово", "вырезано")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
-                         "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False)})
+                         "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
+                         "skip": it.get("skip")})
         data += self._missing
         path = self._session_file()
         try:  # json.dumps uses the fast C encoder (json.dump would not); replace = never a half-written file
@@ -1614,7 +1722,7 @@ class MainWindow(QMainWindow):
             if not os.path.exists(d.get("path", "")):
                 self._missing.append(d)
                 continue
-            if d.get("result") is None and d.get("status") != "ошибка":  # it was waiting or being analysed
+            if d.get("result") is None and d.get("status") not in ("ошибка", "пропущен"):  # waiting or analysing
                 d["status"] = "ожидает анализа"
             self._add_item(d["path"], d)
         log_event(f"список файлов восстановлен: {len(self.items)}, нет на диске: {len(self._missing)}")

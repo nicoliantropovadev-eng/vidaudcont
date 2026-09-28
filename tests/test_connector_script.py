@@ -19,7 +19,8 @@ def test_connector_rows_and_write(tmp_path):
             ["1", "TVMariel", "https://youtu.be/MK1f4-h5cxs?si=YR-O_Jz77pPyYIvU", "", ""],
             ["", "", "not a link", "", ""],
             ["", "", "https://www.youtube.com/watch?v=iuAMFrjiKXg&list=PLslYwFi71y1wSTkMKmXb3b0qrQBlQwyFQ", "", ""]]
-    req = {"grid": grid, "requests": [
+    colors = {"3,1": {"bg": "#ff0000"}, "5,3": {"fg": "#cc0000"}}
+    req = {"grid": grid, "colors": colors, "requests": [
         {"method": "GET", "body": {"key": "bad", "action": "ping"}},
         {"method": "GET", "body": {"key": "k123", "action": "ping"}},
         {"method": "GET", "body": {"key": "k123", "action": "rows"}},
@@ -34,10 +35,12 @@ def test_connector_rows_and_write(tmp_path):
     d = json.loads(out.stdout)
     r = d["responses"]
     assert r[0] == {"ok": False, "error": "wrong key"}
-    assert r[1]["ok"] and r[1]["last_row"] == 5
+    assert r[1]["ok"] and r[1]["last_row"] == 5 and r[1]["version"] == 2
     rows = r[2]["rows"]
     assert [(x["row"], x["id"]) for x in rows] == [(2, "4Y3EGPjhiXE"), (3, "MK1f4-h5cxs"), (5, "iuAMFrjiKXg")]
     assert rows[0]["cuts"] == "start-0:13" and rows[0]["note"] == "АМЕРИКАНСКИЙ АКЦЕНТ"
+    assert (rows[0]["bg"], rows[0]["fg"]) == ([], "#000000")
+    assert rows[1]["bg"] == ["#ff0000"] and rows[2]["fg"] == "#cc0000"   # a red row, a red link
     assert r[3] == {"ok": True, "written": 2}
     assert d["grid"][2][3] == "3:10-3:17" and d["grid"][4][3] == "good" and d["grid"][4][4] == "X"
     assert d["formats"]["3,4"] == "@"  # written as plain text

@@ -50,3 +50,30 @@ def topic_score(text, title="", threshold=1.0):
     return {"words": len(words), "hits": len(hits), "per100": round(per100, 1),
             "top_terms": [w for w, _ in Counter(hits).most_common(8)], "title_terms": title_hits,
             "medical": per100 >= threshold or (per100 >= threshold / 2 and bool(title_hits))}
+
+
+# A clinician speaking to a patient who is there: questions and instructions addressed to "you", replies.
+# An examination where the patient mostly listens is still an encounter; a lecture or a voice-over is not.
+ENCOUNTER = [r"\b(?:can|could|would|will) you\b", r"\b(?:do|did|have|are|were) you\b", r"\bif you (?:can|could|just)\b",
+             r"\bi'?d like (?:you|to)\b", r"\bfor me\b", r"\bi'?m (?:just )?going to\b", r"\blet me (?:know|just|have)\b",
+             r"\bis (?:it|that) (?:ok|okay|alright|all right)\b", r"\bdoes (?:it|that|this) (?:hurt|feel)\b",
+             r"\bany (?:pain|discomfort|problems?|questions?)\b", r"\bhow (?:are you|do you feel|have you been)\b",
+             r"\b(?:deep )?breaths?\b", r"\bbreathe\b", r"\bopen your\b", r"\blook (?:at|up|down|ahead|straight)\b",
+             r"\bfollow my\b", r"\bsqueeze\b", r"\brelax\b", r"\b(?:sit|lie|lean) (?:up|down|back|forward|flat)\b",
+             r"\bthank you\b", r"\bwell done\b", r"\b(?:very )?good job\b", r"\bnice to meet you\b", r"\bmy name is\b",
+             r"\bwhat brings you\b", r"\bhow can i help\b", r"\btell me\b", r"\bi feel\b", r"\bi'?ve been\b",
+             r"\bi (?:don'?t|do|did|was|have|had) \w+", r"\byes,? (?:doctor|please|of course)\b"]
+LECTURE = [r"\bin this (?:video|lecture|presentation|tutorial|module|session we)\b", r"\bwelcome (?:to|back)\b",
+           r"\b(?:students?|examiners?|candidates?|viewers?)\b", r"\bsubscribe\b", r"\bslides?\b",
+           r"\btoday we(?:'re| are| will| 'll)\b", r"\bwe(?:'ll| will) (?:discuss|talk|cover|look)\b", r"\bin summary\b",
+           r"\bkey points?\b", r"\blearning (?:objectives?|outcomes?)\b"]
+_ENC = re.compile("|".join(ENCOUNTER), re.I)
+_LEC = re.compile("|".join(LECTURE), re.I)
+
+
+def encounter_score(text):
+    """Phrases of a clinician-patient encounter and of a lecture, per 100 words of the transcript."""
+    text = re.sub(r"\[\d+:\d+\]", " ", text or "")
+    words = max(len(text.split()), 1)
+    return {"words": words, "encounter": round(100 * len(_ENC.findall(text)) / words, 1),
+            "lecture": round(100 * len(_LEC.findall(text)) / words, 1)}

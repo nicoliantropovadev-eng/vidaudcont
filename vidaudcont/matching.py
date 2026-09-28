@@ -31,6 +31,9 @@ def file_keys(path):
     stem = os.path.splitext(os.path.basename(path))[0].strip()
     stem = re.sub(r"(\.{3}|…)$", "", stem)  # "…социальной тревожнос..." (cut by the downloader)
     keys = [normalize(stem)]
+    copy = re.match(r"^(.*\S)\s*\(\d{1,3}\)$", stem)  # "Title (1)": the downloader's second copy of a file
+    if copy:
+        keys.append(normalize(copy.group(1)))
     if PREFIX_RE.match(stem):
         keys.append(normalize(PREFIX_RE.sub("", stem, count=1)))
     return [k for k in dict.fromkeys(keys) if len(k) >= 4]
@@ -119,14 +122,14 @@ def match_files(paths, rows, titles, lang="ru"):
     by_id = {}
     for r in rows:
         by_id.setdefault(r["id"], r)
-    keys = []  # (normalised title, row)
+    keys = []  # (normalised title, row, video id)
     for r in rows:
         t = titles.get(r["id"], {})
         for k in {normalize(t.get(lang, "")), normalize(t.get("orig", ""))}:
             if len(k) >= 4:
-                keys.append((k, r["row"]))
+                keys.append((k, r["row"], r["id"]))
     exact = {}
-    for k, row in keys:
+    for k, row, _ in keys:
         exact.setdefault(k, []).append(row)
 
     result = {}
@@ -145,19 +148,23 @@ def match_files(paths, rows, titles, lang="ru"):
 
 
 def _by_title(fks, keys, exact):
+    """A video can stand in several rows: candidates are videos, the answer is the first row of that video."""
+    first = {}
+    for _, row, vid in keys:
+        first[vid] = min(row, first.get(vid, row))
     for fk in fks:
         if fk in exact:
             return min(exact[fk]), "название"
     for fk in fks:  # cut-off names: the file name is the beginning of exactly one title
-        pref = sorted({row for k, row in keys if len(fk) >= 20 and k.startswith(fk)})
+        pref = {vid for k, _, vid in keys if len(fk) >= 20 and k.startswith(fk)}
         if len(pref) == 1:
-            return pref[0], "название"
+            return first[pref.pop()], "название"
     best = []
     for fk in fks:
-        best += [(difflib.SequenceMatcher(None, fk, k).ratio(), row) for k, row in keys]
+        best += [(difflib.SequenceMatcher(None, fk, k).ratio(), vid) for k, _, vid in keys]
     best.sort(reverse=True)
     if best and best[0][0] >= 0.9:
-        runner_up = max((sc for sc, row in best if row != best[0][1]), default=0.0)
+        runner_up = max((sc for sc, vid in best if vid != best[0][1]), default=0.0)
         if best[0][0] - runner_up >= 0.03:
-            return best[0][1], "похоже"
+            return first[best[0][1]], "похоже"
     return None, ""

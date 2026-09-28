@@ -335,3 +335,55 @@ def test_cut_all_cuts_only_medical_conversations_with_british_accent(tmp_path, m
         w.close()
     finally:
         sheet.close()
+
+
+def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
+    """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
+    get "ПОВТОР строки N" in column E from the downloader dialog."""
+    from vidaudcont import matching
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    titles = {"AAAAAAAAAA1": ("Talk one", "Разговор один"), "BBBBBBBBBB2": ("Talk two", "Разговор два")}
+    monkeypatch.setattr(matching, "original_title", lambda vid: titles[vid][0])
+    monkeypatch.setattr(matching, "localized_title", lambda vid, lang="ru": titles[vid][1])
+    grid = [["", "", "Link", "", ""],
+            ["", "", "https://youtu.be/AAAAAAAAAA1", "", ""],     # row 2
+            ["", "", "https://youtu.be/BBBBBBBBBB2", "", ""],     # row 3: marked red
+            ["", "", "https://youtu.be/AAAAAAAAAA1", "", ""]]     # row 4: the video of row 2 again
+    sheet = MockSheet(grid, key="k")
+    sheet.colors = {3: {"bg": ["#ff0000"], "fg": "#000000"}}
+    try:
+        from vidaudcont.gui.main_window import C_FIT, DownloaderDialog, MainWindow
+        res = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [], "hints": [],
+               "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "accent": None, "topic": None}
+        w = MainWindow()
+        w.settings.only_suitable = False
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
+        fids = {}
+        for name in ("Разговор один.m4a", "Разговор один (1).m4a", "Разговор два.m4a"):
+            shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
+            fids[name] = w._add_item(str(tmp_path / name), {"status": "готово", "result": dict(res)})
+        w.find_rows()
+        wait(app, lambda: not w._match_queued and w.net.pending == 0)
+        it = {n: w.items[f] for n, f in fids.items()}
+        assert [it[n].get("row") for n in fids] == [2, 2, 3]
+        assert it["Разговор один.m4a"].get("skip") is None
+        assert "повтор" in it["Разговор один (1).m4a"]["skip"] and "красным" in it["Разговор два.m4a"]["skip"]
+        assert w.table.item(w._row_of(fids["Разговор два.m4a"]), C_FIT).text() == "✗ пропуск: красная строка"
+        w.cut_all()
+        wait(app, lambda: it["Разговор один.m4a"].get("cut") and w.worker.pending == 0 and w.net.pending == 0)
+        assert os.listdir(tmp_path / "готово") == ["2.m4a"]
+        assert it["Разговор два.m4a"].get("cut") is None and it["Разговор один (1).m4a"].get("cut") is None
+
+        dlg = DownloaderDialog(list(w.sheet_rows.values()), set(), "", False, False, w)
+        assert dlg.links() == []                                   # 2 is in D now, 3 is red, 4 repeats 2
+        assert dlg.repeats_to_mark() == [{"row": 4, "note": "ПОВТОР строки 2"}]
+        old = DownloaderDialog(list(w.sheet_rows.values()), set(), "", False, False, w, script_version=1)
+        assert any("старый" in lbl.text() for lbl in old.findChildren(type(old.count)))
+        w.close()
+    finally:
+        sheet.close()

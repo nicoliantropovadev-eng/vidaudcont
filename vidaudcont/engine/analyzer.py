@@ -630,14 +630,25 @@ def dialogue_structure(models, wav16, segs):
             "turns_per_min": round(per_min, 1), "conversation": bool(conversation), "reason": reason}
 
 
+ENCOUNTER_MIN = 1.0  # clinician-to-patient phrases per 100 words: examinations 1.4-10.8, a lecture 0
+
+
+def encounter(res):
+    """One voice most of the time, but a clinician speaking to a patient who is there (an examination:
+    "can you look at my finger", "take a deep breath", "thank you"), not to an audience."""
+    from .topic import encounter_score
+    e = encounter_score(res.get("transcript") or "")
+    return e["encounter"] >= ENCOUNTER_MIN and e["encounter"] > e["lecture"]
+
+
 def suitability(res):
-    """Why a recording is not a medical conversation with a British accent; [] = it is one.
+    """Why a recording is not a medical conversation (or examination) with a British accent; [] = it is one.
     None when the conversation check has not been done for it yet."""
     d, t, a = res.get("dialogue"), res.get("topic"), res.get("accent")
     if d is None:
         return None
     why = []
-    if d.get("conversation") is False:
+    if d.get("conversation") is False and not encounter(res):
         why.append("НЕ РАЗГОВОР")
     if t and t.get("medical") is False:
         why.append("НЕ МЕДИЦИНСКАЯ ТЕМА")
