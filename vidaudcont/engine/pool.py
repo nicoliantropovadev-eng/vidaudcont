@@ -48,7 +48,8 @@ def plan(threads, ram_gb=None):
 
 def _worker_main(conn, threads):
     """The analysis process: loads the models once, then analyses the files sent through `conn`."""
-    from .analyzer import Models, Settings, analyze, dialogue_structure, load_audio
+    from .analyzer import (Models, Settings, analyze, dialogue_structure, load_audio, speech_segments,
+                           transcribe_full)
     models = Models(threads=threads)
     while True:
         try:
@@ -60,6 +61,11 @@ def _worker_main(conn, threads):
         try:
             if job.get("kind") == "dialogue":  # only the conversation check, for files analysed before it existed
                 res = {"dialogue": dialogue_structure(models, load_audio(job["path"], 16000), job["segments"])}
+            elif job.get("kind") == "transcribe":  # the whole recording as text, for the table
+                conn.send(("progress", 0.05, "расшифровка"))
+                wav = load_audio(job["path"], 16000)
+                segs = job.get("segments") or speech_segments(models, wav)
+                res = {"text": transcribe_full(models, wav, segs)}
             else:
                 res = analyze(job["path"], models, Settings(**job["settings"]),
                               progress=lambda f, t: conn.send(("progress", float(f), t)))
@@ -71,7 +77,8 @@ def _worker_main(conn, threads):
 class AnalysisPool:
     """A queue of analyses served by up to `workers` processes. The callbacks are called from the pool's
     threads: on_progress(fid, fraction, text), on_done(fid, kind, result), on_failed(fid, kind, message).
-    kind is "analyze" (the whole analysis) or "dialogue" (only the conversation check)."""
+    kind is "analyze" (the whole analysis), "dialogue" (only the conversation check) or "transcribe" (the whole
+    recording as text)."""
 
     def __init__(self, on_progress, on_done, on_failed):
         self.on_progress, self.on_done, self.on_failed = on_progress, on_done, on_failed
@@ -112,13 +119,14 @@ class AnalysisPool:
             self.skip.add(fid)
 
     def cancel_all(self):
-        """Drop the queue (returns the dropped ids) and stop the running analyses: they report "остановлено"."""
+        """Drop the queue (returns the dropped (id, kind) pairs) and stop the running jobs: they report "остановлено"."""
         with self.lock:
             self.generation += 1
         dropped = []
         try:
             while True:
-                dropped.append(self.jobs.get_nowait()[0])
+                job = self.jobs.get_nowait()
+                dropped.append((job[0], job[4]))
                 with self.lock:
                     self.pending -= 1
         except queue.Empty:
@@ -159,7 +167,7 @@ class _Slot(threading.Thread):
             try:
                 if gen != pool.generation:  # taken from the queue just as it was stopped
                     pool.on_failed(fid, kind, "остановлено")
-                elif fid in pool.skip:
+                elif fid in pool.skip and kind == "analyze":  # a transcription of a skipped file still runs
                     pool.skip.discard(fid)
                     pool.on_failed(fid, kind, "пропущено")
                 else:

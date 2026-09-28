@@ -84,7 +84,7 @@ def test_stop_and_a_crashed_analysis(clip):
         for fid in (1, 2, 3):
             pool.add(fid, clip, asdict(Settings()))
         c.wait(lambda: 1 in c.progress)
-        assert sorted(pool.cancel_all()) == [2, 3]          # the queue is dropped...
+        assert sorted(pool.cancel_all()) == [(2, "analyze"), (3, "analyze")]   # the queue is dropped...
         c.wait(lambda: 1 in c.failed)
         assert c.failed[1] == "остановлено"                  # ...and the running analysis stopped
         t = time.time()

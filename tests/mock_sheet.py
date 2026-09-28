@@ -8,8 +8,9 @@ import re
 
 
 class MockSheet:
-    def __init__(self, grid, key="k"):
+    def __init__(self, grid, key="k", sheets=None):
         self.grid = grid  # list of rows (lists of str), row 1 = grid[0]
+        self.sheets = {"": grid, "Sheet1": grid, **(sheets or {})}  # other sheets of the table by name
         self.key = key
         self.pending = {}
         self.writes = []
@@ -71,14 +72,16 @@ class MockSheet:
     def close(self):
         self.httpd.shutdown()
 
-    def cell(self, row, col):
-        line = self.grid[row - 1] if row - 1 < len(self.grid) else []
+    def cell(self, row, col, sheet=""):
+        grid = self.sheets[sheet]
+        line = grid[row - 1] if row - 1 < len(grid) else []
         return line[col - 1] if col - 1 < len(line) else ""
 
-    def set(self, row, col, value):
-        while len(self.grid) < row:
-            self.grid.append([])
-        line = self.grid[row - 1]
+    def set(self, row, col, value, sheet=""):
+        grid = self.sheets[sheet]
+        while len(grid) < row:
+            grid.append([])
+        line = grid[row - 1]
         while len(line) < col:
             line.append("")
         line[col - 1] = value
@@ -87,6 +90,9 @@ class MockSheet:
         if p.get("key") != self.key:
             return {"ok": False, "error": "wrong key"}
         link, cuts, note = int(p.get("link_col", 3)), int(p.get("cuts_col", 4)), int(p.get("note_col", 5))
+        sheet = p.get("sheet") or ""
+        if sheet not in self.sheets:
+            return {"ok": False, "error": "no sheet: " + sheet}
         if p.get("action") == "ping":
             return {"ok": True, "version": self.version, "spreadsheet": "Mock", "sheet": "Sheet1", "last_row": len(self.grid)}
         if p.get("action") == "rows":
@@ -103,8 +109,8 @@ class MockSheet:
             for u in p.get("updates", []):
                 self.writes.append(u)
                 if u.get("cuts") is not None:
-                    self.set(int(u["row"]), cuts, u["cuts"])
+                    self.set(int(u["row"]), cuts, u["cuts"], sheet)
                 if u.get("note") is not None:
-                    self.set(int(u["row"]), note, u["note"])
+                    self.set(int(u["row"]), note, u["note"], sheet)
             return {"ok": True, "written": len(p.get("updates", []))}
         return {"ok": False, "error": "unknown action"}

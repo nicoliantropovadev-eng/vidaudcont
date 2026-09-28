@@ -67,6 +67,12 @@ def test_client_repeats_passing_google_errors(sheet, monkeypatch):
         SheetClient(sheet.url, "k", cancelled=lambda: True).rows()
 
 
+def test_chunks_for_whisper():
+    from vidaudcont.engine.analyzer import speech_chunks_for_asr
+    segs = [(0.0, 2.0), (2.5, 10.0), (20.0, 21.0), (30.0, 95.0), (96.0, 96.1), (99.0, 99.2)]
+    assert speech_chunks_for_asr(segs) == [(0.0, 10.0), (20.0, 21.0), (30.0, 58.0), (58.0, 86.0), (86.0, 96.1)]
+
+
 def test_client_rejects_non_https():
     with pytest.raises(SheetError):
         SheetClient("http://example.com/exec", "k")
@@ -119,3 +125,10 @@ def test_connection_moves_to_another_computer(sheet):
             import_connection(bad)
     with pytest.raises(SheetError, match="Скопировать подключение"):
         SheetClient(sheet.url, "другой").rows()
+
+
+def test_column_letters():
+    from vidaudcont.gui.main_window import col_letter
+    from vidaudcont.sheet import col_number
+    assert [col_letter(n) for n in (1, 2, 3, 26, 27, 52)] == ["A", "B", "C", "Z", "AA", "AZ"]
+    assert all(col_number(col_letter(n)) == n for n in range(1, 200))

@@ -451,3 +451,50 @@ def test_sheet_dialog_copies_the_connection_to_another_computer(monkeypatch):
     second._import()
     assert "не подключение" in second.ping_result.text()
     app.processEvents()
+
+
+@pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
+def test_every_video_is_transcribed_into_its_own_sheet(tmp_path, monkeypatch):
+    """With a sheet for transcripts set, every file with a row is transcribed — fitting or not, red rows too, a second
+    copy of a video not — and row N of that sheet gets the link (A) and the text (B)."""
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    grid = [["", "", "Link", "", ""], ["", "", "https://youtu.be/AAAAAAAAAA1&list=X", "", ""],
+            ["", "", "https://youtu.be/BBBBBBBBBB2", "", "НЕ РАЗГОВОР"]]
+    texts = []
+    sheet = MockSheet(grid, key="k", sheets={"Расшифровки": texts})
+    try:
+        from vidaudcont.gui.main_window import C_TEXT, MainWindow
+        w = MainWindow()
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "text_sheet": "Расшифровки"}
+        w.sheet_rows = {r["row"]: r for r in [{"row": 2, "id": "AAAAAAAAAA1", "link": grid[1][2]},
+                                              {"row": 3, "id": "BBBBBBBBBB2", "link": grid[2][2]}]}
+        fids = []
+        for name, row, skip in (("один.m4a", 2, None), ("два.m4a", 3, "строка отмечена красным"),
+                                ("один (1).m4a", 2, "повтор: это же видео (строка 2) — файл один.m4a")):
+            shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
+            fids.append(w._add_item(str(tmp_path / name), {"row": row, "status": "готово", "skip": skip}))
+        w._check_texts()
+        assert w._text_pending == {fids[0], fids[1]}                      # not the second copy
+        wait(app, lambda: not w._text_pending, timeout=300)
+        w._flush_texts()
+        wait(app, lambda: w.items[fids[0]].get("text_written") and w.items[fids[1]].get("text_written"), timeout=60)
+        assert sheet.cell(2, 1, "Расшифровки") == "https://www.youtube.com/watch?v=AAAAAAAAAA1"
+        assert "carrot" in sheet.cell(2, 2, "Расшифровки").lower()          # the self-test clip is read speech
+        assert sheet.cell(3, 1, "Расшифровки").endswith("BBBBBBBBBB2") and sheet.cell(3, 2, "Расшифровки")
+        assert w.items[fids[2]].get("full_text") is None
+        assert w.table.item(w._row_of(fids[0]), C_TEXT).text() == "✓ в таблице"
+        assert sheet.cell(2, 4) == ""                                     # the main sheet is left alone
+        from vidaudcont.gui import main_window
+        monkeypatch.setattr(main_window, "CELL_MAX", 40)                  # a long text goes on in C, D, …
+        w.items[fids[0]]["text_written"] = False
+        w._flush_texts()
+        wait(app, lambda: w.items[fids[0]].get("text_written") and w.net.pending == 0, timeout=60)
+        full = w.items[fids[0]]["full_text"]
+        cells = [sheet.cell(2, c, "Расшифровки") for c in range(2, 2 + (len(full) + 39) // 40)]
+        assert "".join(cells) == full and all(len(c) <= 40 for c in cells)
+        w.close()
+    finally:
+        sheet.close()

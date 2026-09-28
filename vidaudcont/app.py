@@ -100,6 +100,10 @@ def selftest(out_json=None, gui=False):
         check("расшифровка для темы", bool(r["transcript"].strip()), r["transcript"][:80])
         d = r.get("dialogue") or {}
         check("проверка «разговор или нет»", "separation" in d, d)
+        from .engine.analyzer import load_audio, speech_segments, transcribe_full
+        m = Models()
+        full = transcribe_full(m, load_audio(src, 16000), r["segments"])
+        check("полная расшифровка", "carrot" in full.lower() and len(full) > 200, full[:120])
 
         from dataclasses import asdict
 

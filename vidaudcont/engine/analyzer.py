@@ -577,6 +577,39 @@ def transcribe_excerpts(models, wav16, dur, segs, n_excerpts=4, excerpt=45.0):
     return "\n".join(f"[{fmt_time(s)}] {t}" for s, t in zip(starts, texts))
 
 
+def speech_chunks_for_asr(segs, max_len=28.0, join_gap=1.5):
+    """Speech segments grouped into pieces Whisper takes at once (it hears 30 s at a time)."""
+    out = []
+    for s, e in segs:
+        while e - s > max_len:  # a very long stretch of speech: cut it into Whisper-sized pieces
+            out.append([s, s + max_len])
+            s += max_len
+        if out and s - out[-1][1] <= join_gap and e - out[-1][0] <= max_len:
+            out[-1][1] = e
+        else:
+            out.append([s, e])
+    return [(a, b) for a, b in out if b - a >= 0.3]
+
+
+def transcribe_full(models, wav16, segs, paragraph_gap=3.0):
+    """The whole recording as text: every stretch of speech, a new paragraph after a longer pause."""
+    chunks = speech_chunks_for_asr(segs)
+    if not chunks:
+        return ""
+    clips = [np.ascontiguousarray(wav16[int(a * 16000):int(b * 16000)], dtype=np.float32) for a, b in chunks]
+    texts = _transcribe_in_subprocess(models, clips) if models.asr_in_subprocess else transcribe(models.asr(), clips)
+    out, prev_end = [], None
+    for (a, b), t in zip(chunks, texts):
+        t = t.strip()
+        if not t:
+            continue
+        if out:
+            out.append("\n" if a - prev_end >= paragraph_gap else " ")
+        out.append(t)
+        prev_end = b
+    return "".join(out)
+
+
 # ---------------------------------------------------------------- conversation or not
 SPEAKER_WIN = 1.5           # pieces of speech of this length get a speaker embedding each
 DIALOGUE_SEPARATION = 0.15  # two groups of voices at least this far apart (silhouette) = two people ...

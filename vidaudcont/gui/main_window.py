@@ -21,7 +21,7 @@ from .. import __version__, cutter
 from ..engine.analyzer import Settings, default_threads, suitability
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
-from ..downloads import FolderWatcher, first_rows, norm_path, repeats, select_links, write_links
+from ..downloads import FolderWatcher, clean_link, first_rows, norm_path, repeats, select_links, write_links
 from ..matching import TitleCache, match_files
 from ..sheet import (SCRIPT_VERSION, SheetClient, SheetError, export_connection, import_connection, new_key,
                      row_marked_red, script_code)
@@ -47,6 +47,15 @@ SETTING_LABELS = {
     "dialogue": ("Определять, разговор ли это (два голоса по очереди)", None, None, None),
     "only_suitable": ("«Вырезать все»: только разговоры на медицинскую тему с британским акцентом", None, None, None),
 }
+
+
+def col_letter(n):
+    """1 -> A, 27 -> AA."""
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 def clipboard():
@@ -118,6 +127,9 @@ class Worker(QThread):
             try:
                 if kind == "match":
                     res = self._match(payload, report)
+                elif kind == "texts":  # transcripts into their own sheet: A = link, B = text, same row numbers
+                    SheetClient.from_config(payload["cfg"], cancelled=self.cancel_flag.is_set).write(payload["updates"])
+                    res = {"fids": payload["fids"]}
                 elif kind == "rows":
                     client = SheetClient.from_config(payload["cfg"], retries=2, cancelled=self.cancel_flag.is_set)
                     res = {"rows": client.rows(), "version": client.version}
@@ -332,6 +344,12 @@ class SheetDialog(QDialog):
         self.overwrite = QCheckBox("Перезаписывать таймкоды, которые уже есть в таблице")
         self.overwrite.setChecked(self.cfg.get("overwrite", False))
         form.addRow(self.overwrite)
+        self.text_sheet = QLineEdit(self.cfg.get("text_sheet", ""))
+        self.text_sheet.setPlaceholderText("пусто — не расшифровывать")
+        self.text_sheet.setToolTip("Лист этой же таблицы (создайте его сами). Расшифровка видео из строки N основного "
+                                   "листа попадёт в строку N этого листа: в A — ссылка, в B — текст. Расшифровываются "
+                                   "все видео, и подходящие, и нет")
+        form.addRow("Лист для расшифровок", self.text_sheet)
         self.lang = QLineEdit(self.cfg.get("lang", "ru"))
         self.lang.setMaximumWidth(40)
         self.lang.setToolTip("На каком языке YouTube показывал названия, когда вы скачивали файлы (ru, en, …)")
@@ -385,6 +403,15 @@ class SheetDialog(QDialog):
                 "<br><span style='color:#c62828'>Код скрипта в таблице старый: программа не видит строки, отмеченные "
                 "красным. Скопируйте код заново, замените его в Apps Script, сохраните, затем «Начать развёртывание» → "
                 "«Управление развёртываниями» → карандаш → Версия: «Новая версия» → «Развернуть».</span>"))
+            text_sheet = self.text_sheet.text().strip()
+            if text_sheet:
+                try:
+                    SheetClient.from_config(dict(self.values(), sheet=text_sheet), retries=1, timeout=30).ping()
+                    self.ping_result.setText(self.ping_result.text() + f"<br>✓ Лист для расшифровок «{text_sheet}» есть.")
+                except SheetError as e:
+                    self.ping_result.setText(self.ping_result.text() + f"<br><span style='color:#c62828'>Лист для "
+                                             f"расшифровок «{text_sheet}»: {e}. Создайте его в таблице (имя — точь-в-точь)."
+                                             "</span>")
         except (SheetError, ValueError) as e:
             self.ping_result.setText(f"<span style='color:#c62828'>{e}</span>")
         finally:
@@ -394,7 +421,8 @@ class SheetDialog(QDialog):
         return dict(self.cfg, url=self.url.text().strip(), sheet=self.sheet.text().strip(),
                     link_col=self.link_col.text().strip() or "C", cuts_col=self.cuts_col.text().strip() or "D",
                     note_col=self.note_col.text().strip() or "E", write_note=self.write_note.isChecked(),
-                    overwrite=self.overwrite.isChecked(), lang=self.lang.text().strip() or "ru")
+                    overwrite=self.overwrite.isChecked(), lang=self.lang.text().strip() or "ru",
+                    text_sheet=self.text_sheet.text().strip())
 
 
 class DownloaderDialog(QDialog):
@@ -524,9 +552,12 @@ class DownloaderDialog(QDialog):
                 if not (by_row[r].get("note") or "").strip() and not row_marked_red(by_row[r])]
 
 
-COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Подходит", "Вырезано"]
-COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 150, 90]
-C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_FIT, C_CUT = range(9)
+COLS = ["Файл", "Строка", "Длит.", "Статус", "Таймкоды для вырезки", "Акцент", "Тема", "Подходит", "Текст",
+        "Вырезано"]
+COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 150, 80, 90]
+C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_FIT, C_TEXT, C_CUT = range(10)
+CELL_MAX = 49000  # a Google Sheets cell holds at most 50 000 characters
+TEXTS_PER_WRITE = 20
 SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина"}
 MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
 
@@ -564,6 +595,11 @@ class MainWindow(QMainWindow):
         self._row_index = {}  # fid -> table row, checked on every use and rebuilt when stale
         self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
         self._dialogue_pending = set()  # files whose conversation check is queued
+        self._text_pending = set()      # files whose transcription is queued
+        self._texts_in_flight = set()   # transcripts being written to the table
+        self.text_timer = QTimer(self)  # transcripts go to the table in batches
+        self.text_timer.setSingleShot(True)
+        self.text_timer.timeout.connect(self._flush_texts)
         self._rows_then = None  # what to do once the table has been read in the background
         self.sheet_version = None  # version of the script in the table (2 = reports row colours)
         self.save_timer = QTimer(self)  # many changes in a row end up in one write of the file list
@@ -691,7 +727,8 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.checks)
         self.transcript = QPlainTextEdit()
         self.transcript.setReadOnly(True)
-        self.transcript.setPlaceholderText("Фрагменты расшифровки (для проверки темы)")
+        self.transcript.setPlaceholderText("Расшифровка (целиком — если задан лист для расшифровок в «Таблица…», "
+                                           "иначе фрагменты для проверки темы)")
         self.transcript.setMaximumHeight(120)
         rl.addWidget(self.transcript)
 
@@ -783,7 +820,8 @@ class MainWindow(QMainWindow):
         it = {"path": path, "status": "ожидает анализа", "result": None, "text": None, "cut": None,
               "row": None, "row_how": ""}
         if state:
-            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted", "skip")
+            it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted", "skip",
+                                                 "full_text", "text_written")
                        if k in state and state.get(k) is not None})
         self.items[fid] = it
         self._loading = True
@@ -863,6 +901,14 @@ class MainWindow(QMainWindow):
             fit_item.setToolTip(("Не подходит: " + ", ".join(why) + "\n" if why else "") + (
             f"Голосов: {'два' if d.get('separation', 0) >= 0.15 else 'один'}, реплики сменяются {d['turns_per_min']} раз "
             f"в минуту речи" if "turns_per_min" in d else d.get("reason", "")))
+        text_item = self.table.item(r, C_TEXT)
+        if it.get("text_written"):
+            text_item.setText("✓ в таблице")
+        elif it.get("full_text") is not None:
+            text_item.setText("готов")
+        else:
+            text_item.setText("…" if fid in self._text_pending else "")
+        text_item.setToolTip((it.get("full_text") or "")[:1500])
         cut = it.get("cut")
         cut_item = self.table.item(r, C_CUT)
         cut_item.setText(("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
@@ -943,7 +989,7 @@ class MainWindow(QMainWindow):
                                            f"{c['end'] - c['start']:.0f} с", ", ".join(c["reasons"])]):
                     self.reasons.setItem(r, col, QTableWidgetItem(val))
             self.checks.setText(self._checks_html(res))
-            self.transcript.setPlainText(res.get("transcript") or "")
+            self.transcript.setPlainText(it.get("full_text") or res.get("transcript") or "")
         self._update_timeline()
         self._show_cut_info(it)
         if "has_video" not in it:
@@ -1059,6 +1105,7 @@ class MainWindow(QMainWindow):
 
     def analyze_all(self):
         self._check_dialogues()
+        self._check_texts()
         n = 0
         for fid, it in self.items.items():
             if it["result"] is None and not it["status"].startswith(("в очереди", "анализ")):
@@ -1074,6 +1121,55 @@ class MainWindow(QMainWindow):
         it["status"] = "в очереди"
         self._refresh_row(fid)
         self.pool.add(fid, it["path"], asdict(self.settings))
+        self.progress.setVisible(True)
+
+    def _text_cfg(self):
+        """The connection for the transcripts sheet (same script, another sheet: A = link, B = text), or None."""
+        name = (self.sheet_cfg.get("text_sheet") or "").strip()
+        if not (self.sheet_cfg.get("url") and name):
+            return None
+        return dict(self.sheet_cfg, sheet=name, link_col="A", cuts_col="A", note_col="B")
+
+    def _check_texts(self):
+        """Every video with a row is transcribed, fitting or not; the second copy of a video is not."""
+        if not self._text_cfg():
+            return
+        for fid, it in self.items.items():
+            if it.get("full_text") is not None or fid in self._text_pending or not it.get("row"):
+                continue
+            if "повтор" in (it.get("skip") or ""):
+                continue
+            segs = (it.get("result") or {}).get("segments")
+            self._text_pending.add(fid)
+            self.pool.add(fid, it["path"], asdict(self.settings), kind="transcribe", extra={"segments": segs})
+            self._refresh_row(fid)
+            self.progress.setVisible(True)
+
+    def _flush_texts(self):
+        """Writes finished transcripts to their sheet, a batch at a time."""
+        cfg = self._text_cfg()
+        if not cfg or self._texts_in_flight:
+            return
+        todo = [fid for fid, it in self.items.items()
+                if it.get("full_text") is not None and not it.get("text_written") and it.get("row")
+                and self.sheet_rows.get(it["row"])][:TEXTS_PER_WRITE]
+        if not todo:
+            return
+        updates, more = [], {}  # more: pair of columns (C+D, E+F, …) -> updates for texts longer than a cell
+        for fid in todo:
+            it = self.items[fid]
+            text = it["full_text"] or "(речи не найдено)"
+            parts = [text[i:i + CELL_MAX] for i in range(0, len(text), CELL_MAX)]
+            updates.append({"row": it["row"], "cuts": clean_link(self.sheet_rows[it["row"]]["id"]), "note": parts[0]})
+            for k in range(1, len(parts), 2):  # about 50 minutes of speech per cell: the rest goes on to C, D, …
+                more.setdefault(k, []).append({"row": it["row"], "cuts": parts[k],
+                                               "note": parts[k + 1] if k + 1 < len(parts) else None})
+        for k, ups in sorted(more.items()):  # queued first: done by the time the A/B batch reports back
+            first = col_letter(k + 2)
+            self.net.add(0, "texts", {"cfg": dict(cfg, cuts_col=first, note_col=col_letter(k + 3)), "updates": ups,
+                                      "fids": []})
+        self._texts_in_flight = set(todo)
+        self.net.add(0, "texts", {"cfg": cfg, "updates": updates, "fids": todo})
         self.progress.setVisible(True)
 
     def _check_dialogues(self):
@@ -1101,6 +1197,8 @@ class MainWindow(QMainWindow):
                 if it["result"] is None and it["status"] == "ожидает анализа":
                     self._queue_analysis(fid)
         self._check_dialogues()
+        self._check_texts()
+        self.text_timer.start(3000)
         if self.sheet_cfg.get("url") and any(not it.get("row") and it.get("row_how") != "вручную"
                                              for it in self.items.values()):
             self.find_rows(quiet=True)
@@ -1137,6 +1235,8 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.sheet_cfg = dlg.values()
             self.qs.setValue("sheet", json.dumps(self.sheet_cfg))
+            self._check_texts()
+            self.text_timer.start(3000)
             if self.sheet_cfg.get("url") and self.items:
                 self.find_rows()
 
@@ -1182,6 +1282,7 @@ class MainWindow(QMainWindow):
         missing = [os.path.basename(p) for p, (row, _) in res["matches"].items() if row is None]
         skipped = self._mark_skips()
         self._save_session()
+        self._check_texts()
         msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
         if skipped:
             msg += f" Пропускаются (красная строка или повтор): {skipped}."
@@ -1538,15 +1639,20 @@ class MainWindow(QMainWindow):
 
     def stop_all(self):
         self.match_timer.stop()
-        for fid in self.pool.cancel_all():
+        for fid, kind in self.pool.cancel_all():
+            self._dialogue_pending.discard(fid)
+            self._text_pending.discard(fid)
             if fid in self.items:
-                self.items[fid]["status"] = "остановлено"
+                if kind == "analyze":
+                    self.items[fid]["status"] = "остановлено"
                 self._refresh_row(fid)
         for fid, kind, _ in self.worker.cancel_all() + self.net.cancel_all():
             if kind == "match":
                 self._match_queued = False
             elif kind == "rows":
                 self._rows_then = None
+            elif kind == "texts":
+                self._texts_in_flight = set()
             elif fid in self.items and kind in ("analyze", "cut"):
                 self.items[fid]["status"] = "остановлено"
                 self._refresh_row(fid)
@@ -1570,6 +1676,33 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "transcribe":
+            self._text_pending.discard(fid)
+            it = self.items.get(fid)
+            if it:
+                it["full_text"], it["text_written"] = res["text"], False
+                self._refresh_row(fid)
+                if fid == self.current:
+                    self._show_details(fid)
+                self._save_session()
+                if not self.text_timer.isActive():
+                    self.text_timer.start(5000)
+            self._maybe_idle()
+            return
+        if kind == "texts":
+            if not res["fids"]:  # the continuation of long texts in C, D, …
+                self._maybe_idle(keep_text=True)
+                return
+            for f in res["fids"]:
+                if f in self.items:
+                    self.items[f]["text_written"] = True
+                    self._refresh_row(f)
+            self._texts_in_flight = set()
+            self._save_session()
+            self.status_text.setText(f"Расшифровки записаны в таблицу: {len(res['fids'])}.")
+            self._flush_texts()  # the next batch, if any
+            self._maybe_idle(keep_text=True)
+            return
         if kind == "dialogue":
             self._dialogue_pending.discard(fid)
             it = self.items.get(fid)
@@ -1622,6 +1755,7 @@ class MainWindow(QMainWindow):
                 it["result"], it["text"], it["cut"] = res, None, None
                 it["status"] = "готово"
                 log_event(f"анализ: {os.path.basename(it['path'])} -> {res['timecodes']}")
+                QTimer.singleShot(0, self._check_texts)
             else:
                 it["cut"] = res
                 ok = (res.get("verification") or {}).get("lossless")
@@ -1642,6 +1776,19 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind in ("transcribe", "texts"):  # no window: the file keeps its analysis, the text comes later
+            self._text_pending.discard(fid)
+            if kind == "texts":
+                self._texts_in_flight = set()
+                self.text_timer.start(60000)
+            if msg != "остановлено":
+                log_event(f"ошибка ({kind}): {msg}")
+                self.status_text.setText(("Не удалось записать расшифровки в таблицу — повторю через минуту: " if kind == "texts"
+                                          else "Не удалось расшифровать файл: ") + msg.splitlines()[0])
+            if fid in self.items:
+                self._refresh_row(fid)
+            self._maybe_idle(keep_text=True)
+            return
         if msg == "пропущено":  # dropped from the queue: its row is red or it is a second copy
             if fid in self.items:
                 self._refresh_row(fid)
@@ -1740,7 +1887,8 @@ class MainWindow(QMainWindow):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
-                         "skip": it.get("skip")})
+                         "skip": it.get("skip"), "full_text": it.get("full_text"),
+                         "text_written": it.get("text_written", False)})
         present = {norm_path(it["path"]) for it in self.items.values()}
         self._missing = [d for d in self._missing if norm_path(d.get("path", "")) not in present]  # it came back
         data += self._missing
