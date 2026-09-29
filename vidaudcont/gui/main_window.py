@@ -566,7 +566,8 @@ WATCH_ACTIONS = [("analyze", "анализировать и вырезать, к
 class DownloaderDialog(QDialog):
     """Links for 4K Video Downloader+ and the folder the program watches for finished downloads."""
 
-    def __init__(self, rows, have_rows, watch_dir, watching, watch_action, parent=None, script_version=SCRIPT_VERSION):
+    def __init__(self, rows, have_rows, watch_dir, watching, watch_action, parent=None, script_version=SCRIPT_VERSION,
+                 work_spec=""):
         super().__init__(parent)
         if isinstance(watch_action, bool):  # older callers: analyse or not
             watch_action = "analyze" if watch_action else "add"
@@ -626,6 +627,20 @@ class DownloaderDialog(QDialog):
             self.action.addItem(label, key)
         self.action.setCurrentIndex([k for k, _ in WATCH_ACTIONS].index(watch_action))
         form.addRow("Новые файлы из папки", self.action)
+        work = QHBoxLayout()
+        self.work = QLineEdit(work_spec)
+        self.work.setPlaceholderText("все строки")
+        self.work.setToolTip("Например: 300-420 или 300-420, 450, 500-510")
+        same = QPushButton("= строки выше")
+        same.setToolTip("Те же строки, для которых копируются ссылки")
+        same.clicked.connect(lambda: self.work.setText(f"{self.first.value()}-{self.last.value()}"))
+        work.addWidget(self.work)
+        work.addWidget(same)
+        form.addRow("Анализировать только строки", work)
+        work_note = QLabel(f"Файлы из других строк программа не трогает: не анализирует, не расшифровывает и не "
+                           f"вырезает, они ждут со статусом «{OUT_OF_ROWS}». Пусто — все строки.")
+        work_note.setWordWrap(True)
+        form.addRow(work_note)
         buttons = QHBoxLayout()
         b_copy = QPushButton("Скопировать ссылки")
         b_copy.clicked.connect(self._copy)
@@ -682,8 +697,17 @@ class DownloaderDialog(QDialog):
             write_links(path, links)
             self.count.setText(f"{len(links)}  — сохранено в {os.path.basename(path)}")
 
+    def accept(self):
+        try:
+            parse_rows(self.work.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Анализировать только строки", str(e))
+            return
+        super().accept()
+
     def values(self):
-        return self.watch_dir.text().strip(), self.watching.isChecked(), self.action.currentData()
+        return (self.watch_dir.text().strip(), self.watching.isChecked(), self.action.currentData(),
+                self.work.text().strip())
 
     def repeats_to_mark(self):
         """Updates for column E of repeated videos not marked yet (and not red, which the user already marked)."""
@@ -853,6 +877,8 @@ CELL_MAX = 49000  # a Google Sheets cell holds at most 50 000 characters
 TEXTS_PER_WRITE = 20
 SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина"}
 MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
+WAIT_ROW = "ждёт номера строки"       # rows are chosen for the analysis and this file's row is not known yet
+OUT_OF_ROWS = "вне выбранных строк"  # ...and its row is not among them: it waits
 
 
 class MainWindow(QMainWindow):
@@ -894,6 +920,8 @@ class MainWindow(QMainWindow):
             ("analyze" if self.qs.value("auto_analyze", "true") == "true" else "add")
         self.text_done_rows = set()  # videos (ids) with a link on the transcripts sheet, as last read
         self.text_spec = self.qs.value("text_rows", "") or ""  # rows chosen for transcripts ("" = every row)
+        self.work_spec = self.qs.value("work_rows", "") or ""  # rows chosen for the analysis ("" = every row)
+        self._update_title()
         self.text_dir = self.qs.value("text_dir", "") or ""     # videos downloaded only for their transcripts
         self.text_watching = self.qs.value("text_watching", "false") == "true"
         self.text_watcher = FolderWatcher(self.text_dir)
@@ -906,6 +934,7 @@ class MainWindow(QMainWindow):
         self._missing = []  # saved entries whose file is not on disk now: kept in the saved list, not shown
         self._dialogue_pending = set()  # files whose conversation check is queued
         self._text_pending = set()      # files whose transcription is queued
+        self._analysis_pending = set()  # files whose analysis is queued or running
         self._names_dialog = None
         self.seen = self._load_seen()   # every file ever added: the downloads folder gives each only once
         self._texts_in_flight = set()   # transcripts being written to the table
@@ -1251,15 +1280,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Строка", "Номер строки — это целое число, например 80.")
         self._refresh_row(fid)
         self._save_session()
+        if self.work_spec:  # a file waiting for its row, or now in other rows
+            self._apply_work_rows()
 
     def remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        gone = set()
         for r in rows:
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             self.items.pop(fid, None)
+            gone.add(fid)
             self.table.removeRow(r)
+        self.pool.remove(gone)  # their work still waiting in the queue is not done (a running one finishes)
+        for pending in (self._analysis_pending, self._dialogue_pending, self._text_pending):
+            pending -= gone
         self._save_session()
         self.on_select()
+        self._maybe_idle(keep_text=True)
 
     def selected_fid(self):
         rows = self.table.selectionModel().selectedRows()
@@ -1437,12 +1474,18 @@ class MainWindow(QMainWindow):
         self._check_dialogues()
         self._check_words()
         self._check_texts()
-        n = 0
+        wanted, n, waiting = self._work_rows(), 0, 0
         for fid, it in self.items.items():
-            if it["result"] is None and not it.get("text_only") and not it["status"].startswith(("в очереди", "анализ")):
-                self._queue_analysis(fid)
-                n += 1
-        if not n:
+            if it["result"] is None and not it.get("text_only") and not it.get("skip") \
+                    and fid not in self._analysis_pending:
+                if self._auto_analyze(fid, wanted):
+                    n += 1
+                else:
+                    waiting += 1
+        if waiting:
+            self.status_text.setText(f"Анализ запущен: {n}. Ждут — вне строк {self.work_spec} или без номера строки: "
+                                     f"{waiting}. Строки выбираются в «4K Video Downloader+».")
+        elif not n:
             self.status_text.setText("Все файлы уже проанализированы (для повторного анализа — кнопка «Анализировать»).")
 
     def _queue_analysis(self, fid):
@@ -1450,6 +1493,7 @@ class MainWindow(QMainWindow):
         if it.get("skip"):
             return
         it["status"] = "в очереди"
+        self._analysis_pending.add(fid)
         self._refresh_row(fid)
         self.pool.add(fid, it["path"], asdict(self.settings))
         self.progress.setVisible(True)
@@ -1461,10 +1505,10 @@ class MainWindow(QMainWindow):
             return None
         return dict(self.sheet_cfg, sheet=name, link_col="A", cuts_col="A", note_col="B")
 
-    def _text_wanted(self):
-        """Rows chosen in «Расшифровка видео…» (with every row of their videos), or None for every row."""
+    def _rows_of_videos(self, spec):
+        """The rows in `spec` with every row of their videos, or None for every row."""
         try:
-            wanted = parse_rows(self.text_spec)
+            wanted = parse_rows(spec)
         except ValueError:
             return None
         if wanted is None:
@@ -1472,16 +1516,86 @@ class MainWindow(QMainWindow):
         ids = {r["id"] for r in self.sheet_rows.values() if r["row"] in wanted}
         return wanted | {r["row"] for r in self.sheet_rows.values() if r["id"] in ids}
 
+    def _text_wanted(self):
+        """Rows chosen in «Расшифровка видео…» (with every row of their videos), or None for every row."""
+        return self._rows_of_videos(self.text_spec)
+
+    def _work_rows(self):
+        """Rows chosen for the analysis in «4K Video Downloader+» (with every row of their videos), or None for every
+        row. Without the table no file has a row: then every file is worked on."""
+        return self._rows_of_videos(self.work_spec) if self.sheet_cfg.get("url") else None
+
+    @staticmethod
+    def _in_work(it, wanted):
+        """Whether the program works on this file by itself: True; False, its row is not among the rows chosen for
+        the analysis; None, its row is not known yet. Files added only for their transcript always."""
+        if wanted is None or it.get("text_only"):
+            return True
+        if not it.get("row"):
+            return None
+        return it["row"] in wanted
+
+    def _auto_analyze(self, fid, wanted):
+        """Analyses a file the program takes up by itself (from the downloads folder, after a restart, once its row
+        is known) when it is in the rows chosen for the analysis; otherwise the file waits and says why."""
+        it = self.items[fid]
+        if it.get("skip") or it.get("text_only") or it["result"] is not None or fid in self._analysis_pending:
+            return False
+        inside = self._in_work(it, wanted)
+        if inside:
+            self._queue_analysis(fid)
+            return True
+        it["status"] = OUT_OF_ROWS if inside is False else WAIT_ROW
+        self._refresh_row(fid)
+        return False
+
+    def _apply_work_rows(self):
+        """Other rows chosen for the analysis, or files got their rows: work queued for files outside the rows is
+        taken back (a running analysis finishes), waiting files inside them start."""
+        wanted = self._work_rows()
+        back = set()
+        for fid, kind in self.pool.remove({f for f, it in self.items.items() if self._in_work(it, wanted) is not True}):
+            {"analyze": self._analysis_pending, "dialogue": self._dialogue_pending,
+             "transcribe": self._text_pending}.get(kind, set()).discard(fid)
+            back.add(fid)
+        for fid, it in self.items.items():
+            if it["result"] is None and not it.get("text_only") and (fid in back or it["status"] in (WAIT_ROW, OUT_OF_ROWS)):
+                self._auto_analyze(fid, wanted)
+            elif fid in back:
+                self._refresh_row(fid)
+        self._check_dialogues()
+        self._check_words()
+        self._check_texts()
+        self._maybe_idle(keep_text=True)
+
+    def set_work_rows(self, spec):
+        """Only files of these rows are analysed, transcribed and cut by the program itself; "" = every row."""
+        self.work_spec = (spec or "").strip()
+        self.qs.setValue("work_rows", self.work_spec)
+        self._update_title()
+        self._apply_work_rows()
+        self._save_session()
+        self.status_text.setText(f"Анализируются только строки {self.work_spec}: файлы из других строк ждут "
+                                 f"(«{OUT_OF_ROWS}»)." if self.work_spec else "Анализируются все строки.")
+
+    def _update_title(self):
+        spec = (getattr(self, "work_spec", "") or "").strip()
+        self.setWindowTitle(f"VidAudCont {__version__} — " + (f"анализ только строк {spec}" if spec
+                                                              else "вырезка пауз, музыки и лишнего"))
+
     def _check_texts(self):
         """Every video with a row (of the chosen rows) is transcribed, fitting or not; the second copy of a video
         is not."""
         if not self._text_cfg():
             return
-        wanted = self._text_wanted()
+        wanted, work = self._text_wanted(), self._work_rows()
+        with_text = bool(word_list(self.settings.words))  # the analysis transcribes the whole recording
         for fid, it in self.items.items():
             if it.get("full_text") is not None or fid in self._text_pending or not it.get("row"):
                 continue
             if "повтор" in (it.get("skip") or "") or (wanted is not None and it["row"] not in wanted):
+                continue
+            if self._in_work(it, work) is not True or (with_text and fid in self._analysis_pending):
                 continue
             segs = (it.get("result") or {}).get("segments")
             self._text_pending.add(fid)
@@ -1540,10 +1654,11 @@ class MainWindow(QMainWindow):
         (seconds, not a new analysis)."""
         if not self.settings.dialogue:
             return
+        wanted = self._work_rows()
         for fid, it in self.items.items():
             res = it.get("result")
             if res and res.get("dialogue") is None and res.get("segments") is not None and fid not in self._dialogue_pending \
-                    and not it.get("skip"):
+                    and not it.get("skip") and self._in_work(it, wanted) is True:
                 self._dialogue_pending.add(fid)
                 self.pool.add(fid, it["path"], asdict(self.settings), kind="dialogue",
                               extra={"segments": res["segments"]})
@@ -1585,8 +1700,10 @@ class MainWindow(QMainWindow):
     def _check_words(self):
         """Files analysed before these words were looked for, not cut yet: the words are found again in the word times
         kept from their transcription, or the file gets a transcription (not a new analysis)."""
+        wanted = self._work_rows()
         for fid, it in self.items.items():
-            if not self._needs_words(it) or fid in self._text_pending or self._apply_words(fid):
+            if not self._needs_words(it) or fid in self._text_pending or self._in_work(it, wanted) is not True \
+                    or self._apply_words(fid):
                 continue
             self._text_pending.add(fid)
             self.pool.add(fid, it["path"], asdict(self.settings), kind="transcribe",
@@ -1602,9 +1719,10 @@ class MainWindow(QMainWindow):
     def _resume(self):
         """Work left from the previous run goes on by itself: files without analysis, rows not found yet."""
         if self.watch_action != "add":
+            wanted = self._work_rows()
             for fid, it in self.items.items():
                 if it["result"] is None and it["status"] == "ожидает анализа":
-                    self._queue_analysis(fid)
+                    self._auto_analyze(fid, wanted)
         self._check_dialogues()
         self._check_words()
         self._check_texts()
@@ -1692,7 +1810,7 @@ class MainWindow(QMainWindow):
         missing = [os.path.basename(p) for p, (row, _) in res["matches"].items() if row is None]
         skipped = self._mark_skips()
         self._save_session()
-        self._check_texts()
+        self._apply_work_rows()  # files that waited for their row start if it is among the chosen ones
         if self._downloader_dialog is not None:
             self._downloader_dialog.set_have_ids(self._have_ids())
         msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
@@ -1747,7 +1865,7 @@ class MainWindow(QMainWindow):
                     else:
                         it["status"] = "ожидает анализа"
                         if self.watch_action != "add":
-                            self._queue_analysis(fid)
+                            self._auto_analyze(fid, self._work_rows())
             self._refresh_row(fid)
             if fid == self.current:
                 self._show_details(fid)
@@ -1880,13 +1998,13 @@ class MainWindow(QMainWindow):
         rows = list(self.sheet_rows.values()) if self.sheet_cfg.get("url") else []
         have = {it["row"] for it in self.items.values() if it.get("row")}
         dlg = DownloaderDialog(rows, have, self.watch_dir, self.watching, self.watch_action, self,
-                               script_version=self.sheet_version or SCRIPT_VERSION)
+                               script_version=self.sheet_version or SCRIPT_VERSION, work_spec=self.work_spec)
         if dlg.exec():
             marks = dlg.repeats_to_mark()
             if marks:
                 self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": marks})
                 self.progress.setVisible(True)
-            self.watch_dir, self.watching, self.watch_action = dlg.values()
+            self.watch_dir, self.watching, self.watch_action, work = dlg.values()
             self.qs.setValue("watch_dir", self.watch_dir)
             self.qs.setValue("watching", "true" if self.watching else "false")
             self.qs.setValue("watch_action", self.watch_action)
@@ -1895,6 +2013,8 @@ class MainWindow(QMainWindow):
             self._update_watch_timer()
             if self.watching and self.watch_dir:
                 self.status_text.setText(f"Слежу за папкой: {self.watch_dir}")
+            if work != self.work_spec:
+                self.set_work_rows(work)
 
     def _watched(self):
         """(watcher, what to do with its new files) for each folder being watched."""
@@ -1949,11 +2069,15 @@ class MainWindow(QMainWindow):
             self.add_paths(new, text_only=action == "text")
             added = [fid for fid in self.items if fid not in before]
             log_event(f"из папки загрузок добавлено: {len(added)} ({action})")
+            wanted = self._work_rows()
             if action == "analyze":
                 for fid in added:
-                    self._queue_analysis(fid)
+                    self._auto_analyze(fid, wanted)
+            started = {"analyze": " — анализ запущен" if wanted is None else
+                       f" — анализируются только строки {self.work_spec}, ищу строки файлов",
+                       "text": " — только расшифровка"}
             self.status_text.setText(f"Из папки загрузок добавлено файлов: {len(added)}" + (
-                {"analyze": " — анализ запущен", "text": " — только расшифровка"}.get(action, "") if added else ""))
+                started.get(action, "") if added else ""))
 
     def _cuts_for(self, it):
         """(cuts, canonical timecode string) for a file, from the edited field or the analysis."""
@@ -1991,6 +2115,7 @@ class MainWindow(QMainWindow):
 
     def cut_all(self):
         todo, no_row, bad, unfit, unchecked, skipped = [], [], [], [], [], []
+        wanted, outside = self._work_rows(), 0
         for r in range(self.table.rowCount()):
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             it = self.items[fid]
@@ -2000,6 +2125,9 @@ class MainWindow(QMainWindow):
                 continue
             if it.get("skip"):
                 skipped.append(os.path.basename(it["path"]))
+                continue
+            if self._in_work(it, wanted) is False:
+                outside += 1
                 continue
             try:
                 cuts, tc = self._cuts_for(it)
@@ -2029,6 +2157,9 @@ class MainWindow(QMainWindow):
             if no_row:
                 text = (f"У всех проанализированных файлов ({len(no_row)}) пока нет номера строки таблицы. "
                         "Нажмите «Найти строки» или впишите номер двойным щелчком в колонке «Строка».")
+            if outside:
+                text += (f"\n\nВне выбранных строк ({self.work_spec}): {outside} — не вырезаются. Строки выбираются "
+                         "в «4K Video Downloader+».")
             QMessageBox.information(self, "Вырезать все", text)
             return
         with_row = sum(1 for fid, _, _ in todo if self.items[fid].get("row"))
@@ -2052,6 +2183,8 @@ class MainWindow(QMainWindow):
                      "следующем нажатии, если подойдут.\n")
         if skipped:
             text += f"\nПропускаются: строка отмечена красным или повтор ({len(skipped)}).\n"
+        if outside:
+            text += f"\nВне выбранных строк ({self.work_spec}): {outside} — не вырезаются.\n"
         if bad:
             text += "\nПропущены из-за ошибок в таймкодах:\n  " + "\n  ".join(bad[:5]) + "\n"
         if unwritten:
@@ -2189,6 +2322,7 @@ class MainWindow(QMainWindow):
         for fid, kind in self.pool.cancel_all():
             self._dialogue_pending.discard(fid)
             self._text_pending.discard(fid)
+            self._analysis_pending.discard(fid)
             if fid in self.items:
                 if kind == "analyze":
                     self.items[fid]["status"] = "остановлено"
@@ -2226,6 +2360,8 @@ class MainWindow(QMainWindow):
                                                                                if left > 1 else ""))
 
     def on_done(self, fid, kind, res):
+        if kind == "analyze":
+            self._analysis_pending.discard(fid)
         if kind == "compact":
             msg = f"Готово: расшифровок и других строк {res.get('rows', 0)}, пустых строк убрано {res.get('removed', 0)}."
             if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
@@ -2300,6 +2436,8 @@ class MainWindow(QMainWindow):
             self.sheet_rows = {r["row"]: r for r in res["rows"]}
             self.sheet_version = res.get("version")
             self._mark_skips()
+            if self.work_spec:  # the rows of the chosen videos may be others now
+                self._apply_work_rows()
             then, self._rows_then = self._rows_then, None
             self._maybe_idle(keep_text=True)
             if then:
@@ -2366,6 +2504,8 @@ class MainWindow(QMainWindow):
         self._maybe_idle()
 
     def on_failed(self, fid, kind, msg):
+        if kind == "analyze":
+            self._analysis_pending.discard(fid)
         if kind == "compact":
             if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
                 self._downloader_dialog.compacted(f"Не получилось: {msg.splitlines()[0]}")
@@ -2398,6 +2538,7 @@ class MainWindow(QMainWindow):
             self._maybe_idle(keep_text=True)
             return
         if msg == "пропущено":  # dropped from the queue: its row is red or it is a second copy
+            {"dialogue": self._dialogue_pending, "transcribe": self._text_pending}.get(kind, set()).discard(fid)
             if fid in self.items:
                 self._refresh_row(fid)
             self._maybe_idle()

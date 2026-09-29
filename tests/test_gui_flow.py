@@ -10,7 +10,7 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QStandardPaths  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton  # noqa: E402
 
 from vidaudcont import resources  # noqa: E402
 
@@ -453,6 +453,70 @@ def test_phrases_with_listed_words_are_cut_and_found_again_when_the_list_changes
     w.on_done(older, "transcribe", {"text": it["full_text"], "word_times": w._load_words(it)})
     assert not w._needs_words(w.items[older])
     assert w.items[older]["result"]["timecodes"] == res["timecodes"]
+    w.close()
+
+
+def test_only_the_chosen_rows_are_analysed(tmp_path, monkeypatch):
+    """Rows chosen in «4K Video Downloader+»: files of other rows wait (their queued work is taken back), a file without
+    a row waits for it, another video row of a chosen video counts; clearing the rows lets every file go on."""
+    from vidaudcont.gui.main_window import C_ROW, OUT_OF_ROWS, WAIT_ROW, DownloaderDialog, MainWindow
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    warned, told = [], []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    w = MainWindow()
+    queued = []
+    monkeypatch.setattr(w.pool, "add", lambda fid, path, settings, kind="analyze", extra=None: queued.append((fid, kind)))
+
+    def take_back(fids):
+        back = [q for q in queued if q[0] in fids]
+        queued[:] = [q for q in queued if q[0] not in fids]
+        return back
+    monkeypatch.setattr(w.pool, "remove", take_back)
+    w.settings.words = ""
+    w.sheet_cfg = {"url": "https://script.google.com/macros/s/x/exec", "key": "k"}
+    w.sheet_rows = {r: {"row": r, "id": vid * 11, "link": "", "cuts": "", "note": ""}
+                    for r, vid in ((2, "A"), (3, "B"), (4, "C"), (5, "D"), (6, "B"))}   # row 6: the video of row 3
+    res = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [], "hints": [],
+           "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "accent": None, "topic": None,
+           "dialogue": {"conversation": True}}
+    fid = {}
+    for name, row in (("a", 2), ("b", 4), ("c", None), ("d", 6)):
+        fid[name] = w._add_item(str(tmp_path / f"{name}.m4a"), {"row": row, "row_how": "вручную" if row else ""})
+    fid["e"] = w._add_item(str(tmp_path / "e.m4a"), {"status": "готово", "result": dict(res), "row": 5,
+                                                     "row_how": "вручную"})
+    w.set_work_rows("3-4")
+    assert "3-4" in w.windowTitle()
+    w.analyze_all()
+    status = {n: w.items[f]["status"] for n, f in fid.items()}
+    assert sorted(queued) == sorted([(fid["b"], "analyze"), (fid["d"], "analyze")])
+    assert status["a"] == OUT_OF_ROWS and status["c"] == WAIT_ROW and status["e"] == "готово"
+
+    w.table.item(w._row_of(fid["c"]), C_ROW).setText("3")          # its row is typed in: it is one of the chosen
+    assert (fid["c"], "analyze") in queued
+
+    w.set_work_rows("2")                                             # others chosen: queued work is taken back
+    assert queued == [(fid["a"], "analyze")]
+    assert all(w.items[fid[n]]["status"] == OUT_OF_ROWS for n in "bcd")
+    w.cut_all()                                                      # e (row 5) is analysed but not in the rows
+    assert "Вне выбранных строк (2): 1" in told[-1]
+
+    w.set_work_rows("")                                              # every row again
+    assert sorted(queued) == sorted((fid[n], "analyze") for n in "abcd")
+    w.table.selectRow(w._row_of(fid["b"]))
+    w.remove_selected()                                              # taken out of the list: its queued work too
+    assert (fid["b"], "analyze") not in queued and fid["b"] not in w._analysis_pending
+
+    dlg = DownloaderDialog(list(w.sheet_rows.values()), set(), "", False, "analyze", w, work_spec="300-420")
+    assert dlg.work.text() == "300-420"
+    dlg.work.setText("300 до 420")
+    dlg.accept()
+    assert warned and dlg.result() == 0                              # not accepted: the rows are not understood
+    dlg.first.setValue(3)
+    dlg.last.setValue(4)
+    next(b for b in dlg.findChildren(QPushButton) if b.text() == "= строки выше").click()
+    assert dlg.values()[3] == "3-4"
     w.close()
 
 

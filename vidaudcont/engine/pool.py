@@ -122,6 +122,21 @@ class AnalysisPool:
         with self.lock:
             self.skip.add(fid)
 
+    def remove(self, fids):
+        """Takes every queued job of these files out of the queue (running ones finish); returns their (id, kind)."""
+        fids = set(fids)
+        if not fids:
+            return []
+        with self.jobs.mutex:  # the same lock get() and put() take
+            taken = [job for job in self.jobs.queue if job[0] in fids]
+            if taken:
+                keep = [job for job in self.jobs.queue if job[0] not in fids]
+                self.jobs.queue.clear()
+                self.jobs.queue.extend(keep)
+        with self.lock:
+            self.pending -= len(taken)
+        return [(job[0], job[4]) for job in taken]
+
     def cancel_all(self):
         """Drop the queue (returns the dropped (id, kind) pairs) and stop the running jobs: they report "остановлено"."""
         with self.lock:
@@ -227,6 +242,8 @@ class _Slot(threading.Thread):
         proc, conn = self.proc, self.conn
         self.proc = self.conn = None
         if proc is None:
+            return
+        if conn is None:  # the process could not be started
             return
         try:
             conn.send(None)  # finish politely

@@ -24,6 +24,15 @@ def test_plan_keeps_the_total_number_of_threads():
     assert plan(8, ram_gb=4) == (1, 8)
 
 
+def test_queued_jobs_can_be_taken_back():
+    pool = AnalysisPool(lambda *a: None, lambda *a: None, lambda *a: None)  # not configured: nothing takes the jobs
+    for fid, kind in ((1, "analyze"), (2, "analyze"), (1, "transcribe"), (3, "dialogue")):
+        pool.add(fid, "x.m4a", {}, kind=kind)
+    assert pool.remove({1, 3}) == [(1, "analyze"), (1, "transcribe"), (3, "dialogue")]
+    assert pool.pending == 1 and pool.remove(set()) == [] and pool.remove({9}) == []
+    assert pool.cancel_all() == [(2, "analyze")] and pool.pending == 0
+
+
 class Collector:
     def __init__(self):
         self.done, self.failed, self.progress = {}, {}, set()
