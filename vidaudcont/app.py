@@ -79,6 +79,16 @@ def selftest(out_json=None, gui=False):
     tmp = tempfile.mkdtemp(prefix="vidaudcont-selftest-")
     try:
         check("ffmpeg", os.path.exists(resources.tool("ffmpeg")), resources.tool("ffmpeg"))
+        import ssl
+        ca = ssl.create_default_context().cert_store_stats()["x509_ca"]
+        ca_file = os.environ.get("SSL_CERT_FILE", "")
+        if sys.platform in ("darwin", "win32"):  # Linux may keep them in a folder read only when needed
+            # on macOS the list must come with the app: the build machine's own OpenSSL folder is not on the user's Mac
+            own = sys.platform != "darwin" or (os.path.isfile(ca_file) and (not getattr(sys, "frozen", False) or
+                  os.path.abspath(ca_file).startswith(os.path.abspath(getattr(sys, "_MEIPASS", "") or
+                                                                      os.path.dirname(sys.executable)))))
+            check("сертификаты для HTTPS (таблица, названия видео)", ca > 0 and own,
+                  f"{ca} корневых, {ca_file or 'системные'}")
         check("ffprobe", os.path.exists(resources.tool("ffprobe")), resources.tool("ffprobe"))
         src = os.path.join(tmp, "selftest клип.m4a")  # non-ASCII path on purpose
         shutil.copy(resources.asset("selftest.m4a"), src)

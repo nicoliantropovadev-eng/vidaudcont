@@ -13,3 +13,4 @@ av==13.1.0
 huggingface-hub==0.36.0
 tqdm==4.67.1
 PySide6-Essentials==6.7.3
+certifi==2026.7.22

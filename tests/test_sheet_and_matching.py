@@ -134,3 +134,19 @@ def test_column_letters():
     from vidaudcont.sheet import col_number
     assert [col_letter(n) for n in (1, 2, 3, 26, 27, 52)] == ["A", "B", "C", "Z", "AA", "AZ"]
     assert all(col_number(col_letter(n)) == n for n in range(1, 200))
+
+
+def test_macos_app_brings_its_own_root_certificates(monkeypatch):
+    """The Python inside the macOS app does not read the Keychain: without certifi's list the table answered
+    "CERTIFICATE_VERIFY_FAILED" on a Mac."""
+    import importlib
+    import ssl
+    import sys
+
+    import vidaudcont
+    if sys.platform != "darwin":
+        pytest.skip("only macOS")
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    importlib.reload(vidaudcont)
+    assert os.path.isfile(os.environ["SSL_CERT_FILE"])
+    assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 100
