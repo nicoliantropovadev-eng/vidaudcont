@@ -600,6 +600,63 @@ def test_several_files_are_cut_at_once_and_never_share_a_name(tmp_path, monkeypa
     w.close()
 
 
+def test_rows_checked_again_by_length_are_corrected_and_reported(tmp_path, monkeypatch):
+    """Two videos with the same title: both files went to the first of their rows, and the second file was called a
+    repeat. «Найти строки» checks every file again by its length: each gets its own row, nothing is a repeat, and a
+    file already cut under the wrong number is listed."""
+    from vidaudcont import cutter, matching
+
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"a window: {a[2] if len(a) > 2 else a}"))
+    shown = []
+    monkeypatch.setattr(QMessageBox, "open", lambda self: shown.append(self.text()))
+    monkeypatch.setattr(matching, "original_title", lambda vid: "Abdominal examination OSCE guide")
+    monkeypatch.setattr(matching, "localized_title", lambda vid, lang="ru": "")
+    monkeypatch.setattr(matching, "video_length", lambda vid: {"AAAAAAAAAA1": 30, "BBBBBBBBBB2": 76}[vid])
+    grid = [["", "", "Link", "", ""], ["", "", "https://youtu.be/AAAAAAAAAA1", "", ""],
+            ["", "", "https://youtu.be/BBBBBBBBBB2", "", ""]]
+    sheet = MockSheet(grid, key="k")
+    try:
+        from vidaudcont.gui.main_window import MainWindow
+        long_file = tmp_path / "Abdominal examination OSCE guide.m4a"          # 76 s: the video of row 3
+        shutil.copy(resources.asset("selftest.m4a"), long_file)
+        short_file = tmp_path / "Abdominal examination OSCE guide (1).m4a"     # 30 s: the video of row 2
+        cutter.cut(str(long_file), [(30.0, 76.0)], out_path=str(short_file))
+        w = MainWindow()
+        w.settings.words = ""
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
+        fid = {n: w._add_item(str(f), {"row": 2, "row_how": "название"}) for n, f in (("long", long_file),
+                                                                                         ("short", short_file))}
+        cut_as = tmp_path / "готово" / "2.m4a"
+        cut_as.parent.mkdir()
+        cut_as.write_bytes(b"x")
+        w.items[fid["long"]].update(cut={"output": str(cut_as), "sheet": "записано", "verification": {"lossless": True}})
+        w.find_rows()
+        wait(app, lambda: not w._match_queued and w.net.pending == 0, timeout=120)
+        assert (w.items[fid["long"]]["row"], w.items[fid["long"]]["row_how"]) == (3, "название и длительность")
+        assert w.items[fid["short"]]["row"] == 2
+        assert not w.items[fid["short"]].get("skip") and not w.items[fid["long"]].get("skip")
+        assert "Исправлено строк (не совпала длительность): 1" in w.status_text.text()
+        assert shown and "2.m4a" in shown[-1] and "это видео строки 3" in shown[-1]
+
+        import json
+        w.items[fid["long"]].update(row=2, row_how="название")
+        cache = os.path.join(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation), "titles.json")
+        data = json.load(open(cache, encoding="utf-8"))
+        data["BBBBBBBBBB2"]["len"] = 500                                      # no video has the file's length now
+        json.dump(data, open(cache, "w", encoding="utf-8"))
+        w._match_last = 0.0
+        w.find_rows()
+        wait(app, lambda: not w._match_queued and w.net.pending == 0, timeout=120)
+        assert w.items[fid["long"]]["row"] is None
+        assert "длительность файла 1:16 не совпадает с видео строки 2 (0:30)" == w.items[fid["long"]]["row_how"]
+        w.close()
+    finally:
+        sheet.close()
+
+
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
     """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
     get "ПОВТОР строки N" in column E from the downloader dialog."""

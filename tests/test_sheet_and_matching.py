@@ -150,3 +150,37 @@ def test_macos_app_brings_its_own_root_certificates(monkeypatch):
     importlib.reload(vidaudcont)
     assert os.path.isfile(os.environ["SSL_CERT_FILE"])
     assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 100
+
+
+def test_video_length_from_youtube_search(monkeypatch):
+    assert matching.parse_length("6:46") == 406 and matching.parse_length("1:02:03") == 3723
+    assert matching.parse_length("LIVE") is None and matching.parse_length(None) is None
+    answer = {"contents": [{"itemSectionRenderer": {"contents": [
+        {"videoRenderer": {"videoId": "BBBBBBBBBBB", "lengthText": {"simpleText": "9:00"}}},
+        {"videoRenderer": {"videoId": "AAAAAAAAAAA", "lengthText": {"simpleText": "6:46"}}}]}}]}
+    monkeypatch.setattr(matching, "_post_json", lambda url, body, timeout=30: answer)
+    monkeypatch.undo()  # the real video_length (the test fixture replaces it), with the canned answer again
+    monkeypatch.setattr(matching, "_post_json", lambda url, body, timeout=30: answer)
+    assert matching.video_length("AAAAAAAAAAA") == 406
+    assert matching.video_length("DDDDDDDDDDD") is None
+
+
+def test_a_title_match_is_checked_against_the_files_length():
+    rows = [{"row": 2, "id": "AAAAAAAAAAA"}, {"row": 3, "id": "BBBBBBBBBBB"}, {"row": 4, "id": "CCCCCCCCCCC"}]
+    titles = {"AAAAAAAAAAA": {"orig": "Abdominal examination OSCE guide part 1", "ru": ""},
+              "BBBBBBBBBBB": {"orig": "Abdominal examination OSCE guide part 2", "ru": ""},
+              "CCCCCCCCCCC": {"orig": "Taking a history from a patient with chest pain", "ru": ""}}
+    lengths = {"AAAAAAAAAAA": 400, "BBBBBBBBBBB": 612, "CCCCCCCCCCC": 300}
+    one, two, chest = ("Abdominal examination OSCE guide part 1.m4a", "Abdominal examination OSCE guide part 2.m4a",
+                       "Taking a history from a patient with chest pain.m4a")
+    got = matching.match_files([one, two, chest], rows, titles, durations={one: 400.4, two: 399.8, chest: 301.2},
+                               lengths=lengths)
+    assert got[one] == (2, "название")                         # the title and the length agree
+    assert got[two] == (2, "название и длительность")           # "part 2" is as long as part 1: it is part 1's file
+    assert got[chest] == (4, "название")
+    wrong = matching.match_files([chest], rows, titles, durations={chest: 900.0}, lengths=lengths)[chest]
+    assert wrong[0] is None and "не совпадает с видео строки 4" in wrong[1]
+    unknown = matching.match_files([chest], rows, titles, durations={chest: 900.0}, lengths={})[chest]
+    assert unknown == (4, "название")                           # YouTube did not tell: the title decides
+    assert matching.match_files([chest], rows, titles)[chest] == (4, "название")
+    assert matching.length_candidates([one], rows, titles) >= {"AAAAAAAAAAA", "BBBBBBBBBBB"}

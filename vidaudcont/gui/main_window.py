@@ -25,7 +25,7 @@ from ..applog import log_event
 from ..downloads import (FolderWatcher, clean_link, first_rows, norm_path, parse_rows, repeats, select_links,
                          select_text_links, write_links)
 from .. import naming
-from ..matching import TitleCache, match_files
+from ..matching import TitleCache, length_candidates, match_files
 from ..sheet import (COLORS_VERSION, SCRIPT_VERSION, TEXTS_VERSION, SheetClient, SheetError, export_connection,
                      import_connection, new_key, row_marked_red, script_code)
 from ..timecodes import fmt_time, format_cuts, parse
@@ -207,9 +207,20 @@ class Worker(QThread):
         rows = client.rows()
         cache = TitleCache(payload["cache_path"])
         cache.fetch([r["id"] for r in rows], lang=payload["lang"], cancelled=self.cancel_flag.is_set,
-                    progress=lambda f, t: report(0.05 + 0.9 * f, t))
+                    progress=lambda f, t: report(0.05 + 0.75 * f, t))
+        # a title can lead to another video with a near-identical one: the file's length tells them apart
+        durations = dict(payload.get("durations") or {})
+        for p in payload["paths"]:
+            if not durations.get(p):
+                try:
+                    durations[p] = cutter.probe(p)["duration"]
+                except Exception:  # not readable (yet): checked by its title only
+                    pass
+        cache.fetch_lengths(length_candidates(payload["paths"], rows, cache.data, payload["lang"]),
+                            cancelled=self.cancel_flag.is_set, progress=lambda f, t: report(0.8 + 0.18 * f, t))
         return {"rows": rows, "version": client.version,
-                "matches": match_files(payload["paths"], rows, cache.data, lang=payload["lang"])}
+                "matches": match_files(payload["paths"], rows, cache.data, lang=payload["lang"],
+                                       durations=durations, lengths=cache.lengths())}
 
     def _cut(self, payload, report):
         if payload["cuts"]:
@@ -1250,7 +1261,8 @@ class MainWindow(QMainWindow):
         row_item = self.table.item(r, C_ROW)
         row_item.setText(str(it["row"]) if it.get("row") else "")
         info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
-        row_item.setToolTip((f"Найдено: {it.get('row_how')}\n" if it.get("row_how") else "") +
+        how = it.get("row_how")
+        row_item.setToolTip(((f"Найдено: {how}\n" if it.get("row") else f"{how}\n") if how else "") +
                             (info["link"] if info else "Двойной щелчок — указать номер строки вручную"))
         self.table.item(r, C_DUR).setText(fmt_time(res["duration"]) if res else "")
         self.table.item(r, C_STATUS).setText(it["status"])
@@ -1832,8 +1844,10 @@ class MainWindow(QMainWindow):
         if not paths:
             self._match_queued = False
             return
+        durations = {it["path"]: it["result"]["duration"] for it in self.items.values() if it.get("result")}
         self.net.add(0, "match", {"cfg": self.sheet_cfg, "paths": paths, "lang": self.sheet_cfg.get("lang", "ru"),
-                                  "cache_path": os.path.join(app_data_dir(), "titles.json")})
+                                  "cache_path": os.path.join(app_data_dir(), "titles.json"),
+                                  "durations": {p: durations[p] for p in paths if p in durations}})
         self.progress.setVisible(True)
         self.status_text.setText("Ищу строки таблицы для файлов…")
 
@@ -1844,13 +1858,20 @@ class MainWindow(QMainWindow):
         for path in res["matches"]:
             if path in by_path:
                 self.items[by_path[path]]["_match_tried"] = True
-        found = 0
+        found, changed, cut_wrong = 0, [], []
         for path, (row, how) in res["matches"].items():
             fid = by_path.get(path)
             if fid is None or self.items[fid].get("row_how") == "вручную":
                 continue
-            self.items[fid]["row"], self.items[fid]["row_how"] = row, how
+            it = self.items[fid]
+            old = it.get("row")
+            it["row"], it["row_how"] = row, how
             found += row is not None
+            if old and old != row:  # checked again (by the file's length): its row was another video's
+                changed.append(fid)
+                log_event(f"строка исправлена: {os.path.basename(path)}: {old} -> {row or 'не найдена'} ({how})")
+                if it.get("cut") and it["cut"].get("output"):
+                    cut_wrong.append((fid, old, row))
             self._refresh_row(fid)
         missing = [os.path.basename(p) for p, (row, _) in res["matches"].items() if row is None]
         skipped = self._mark_skips()
@@ -1861,9 +1882,21 @@ class MainWindow(QMainWindow):
         msg = f"Строки найдены для {found} из {len(res['matches'])} файлов."
         if skipped:
             msg += f" Пропускаются (красная строка или повтор): {skipped}."
+        if changed:
+            msg += f" Исправлено строк (не совпала длительность): {len(changed)}."
         if missing:
             msg += f" Не найдены: {len(missing)} — укажите номер вручную (двойной щелчок в колонке «Строка»)."
         self.status_text.setText(msg)
+        if cut_wrong and not self._match_quiet:
+            names = [f"{os.path.basename(self.items[f]['cut']['output'])} — {os.path.basename(self.items[f]['path'])}: "
+                     f"это видео строки {new}" if new else
+                     f"{os.path.basename(self.items[f]['cut']['output'])} — {os.path.basename(self.items[f]['path'])}: "
+                     f"его строка не найдена" for f, _, new in cut_wrong]
+            box = QMessageBox(QMessageBox.Information, "Найти строки",
+                              f"Уже вырезаны под неверным номером строки: {len(cut_wrong)}. Их таймкоды записаны в "
+                              "строку с этим номером. Правильные строки теперь в списке программы.\n\n"
+                              + "\n".join(names[:15]) + ("\n…" if len(names) > 15 else ""), parent=self)
+            box.open()
 
     def _mark_skips(self):
         """Files the table says to leave alone: their row is marked red, or another file is the same video
