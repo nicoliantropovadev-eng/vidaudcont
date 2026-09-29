@@ -46,6 +46,10 @@ class CutError(RuntimeError):
     pass
 
 
+class NothingLeft(CutError):
+    """The cuts take the whole file: there is nothing to save."""
+
+
 def probe(path):
     out = resources.run([resources.tool("ffprobe"), "-v", "error", "-print_format", "json", "-show_format",
                          "-show_entries", "stream=index,codec_type,codec_name,sample_rate,channels,bit_rate,"
@@ -131,7 +135,7 @@ def plan(path, cuts, mode="auto"):
     dur = info["duration"]
     keep = keep_segments(cuts, dur)
     if not keep:
-        raise CutError("после вырезания ничего не останется")
+        raise NothingLeft("после вырезания ничего не останется")
     has_video = bool(info["video"])
     if mode == "auto":
         mode = "video" if has_video else "audio"

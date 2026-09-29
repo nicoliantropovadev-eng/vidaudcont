@@ -520,6 +520,45 @@ def test_only_the_chosen_rows_are_analysed(tmp_path, monkeypatch):
     w.close()
 
 
+def test_a_file_cut_whole_is_done_quietly(tmp_path, monkeypatch):
+    """Timecodes that take the whole recording: no window, no file, the timecodes go to the table, and «Вырезать все»
+    does not try the file again."""
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"a window: {a[2] if len(a) > 2 else a}"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    sheet = MockSheet([["", "", "Link", "", ""], ["", "", "https://youtu.be/AAAAAAAAAAA", "", ""]], key="k")
+    try:
+        from vidaudcont.gui.main_window import C_CUT, MainWindow
+        w = MainWindow()
+        w.settings.words, w.settings.only_suitable = "", False
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
+        src = tmp_path / "всё лишнее.m4a"
+        shutil.copy(resources.asset("selftest.m4a"), src)
+        res = {"duration": 76.0, "speech_ratio": 0.0, "timecodes": "start-end", "segments": [], "hints": [],
+               "cuts": [{"start": 0.0, "end": 76.0, "reasons": ["нет речи"]}], "transcript": "", "accent": None,
+               "topic": None, "dialogue": None}
+        fid = w._add_item(str(src), {"status": "готово", "result": res, "row": 2, "row_how": "вручную"})
+        w.cut_all()
+        wait(app, lambda: w.items[fid].get("cut") and w.worker.pending == 0 and w.net.pending == 0, timeout=120)
+        it = w.items[fid]
+        assert it["status"] == "вырезано целиком, в таблице ✓" and it["cut"]["empty"]
+        assert sheet.cell(2, 4) == "start-end"
+        assert not (tmp_path / "готово").exists() or not os.listdir(tmp_path / "готово")
+        assert w.table.item(w._row_of(fid), C_CUT).text() == "— всё вырезано"
+        w.table.selectRow(w._row_of(fid))
+        assert "файл не создан" in w.cut_info.text()
+        w.cut_all()                                          # nothing left to do: it is not tried again
+        assert told and told[-1].startswith("Нет проанализированных файлов")
+        assert w._proper_status(it) == "вырезано целиком, в таблице ✓"
+        w.close()
+    finally:
+        sheet.close()
+
+
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
     """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
     get "ПОВТОР строки N" in column E from the downloader dialog."""

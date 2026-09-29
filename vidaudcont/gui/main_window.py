@@ -182,8 +182,15 @@ class Worker(QThread):
 
     def _cut(self, payload, report):
         if payload["cuts"]:
-            res = cutter.cut(payload["path"], payload["cuts"], out_path=payload.get("out_path"), mode=payload["mode"],
-                             progress=report, cancelled=self.cancel_flag.is_set, tags=payload.get("tags"))
+            try:
+                res = cutter.cut(payload["path"], payload["cuts"], out_path=payload.get("out_path"),
+                                 mode=payload["mode"], progress=report, cancelled=self.cancel_flag.is_set,
+                                 tags=payload.get("tags"))
+            except cutter.NothingLeft:  # the whole recording goes: no file, no window; the timecodes are written
+                dur = cutter.probe(payload["path"])["duration"]
+                res = {"output": "", "mode": "empty", "keep": [], "empty": True,
+                       "notes": ["вырезается вся запись — файл не создан"], "source_duration": dur,
+                       "expected_duration": 0.0, "output_duration": 0.0, "verification": {}}
         else:  # nothing to cut: the file is only copied under its new name (bit-for-bit)
             os.makedirs(os.path.dirname(payload["out_path"]), exist_ok=True)
             shutil.copy2(payload["path"], payload["out_path"])
@@ -1146,7 +1153,7 @@ class MainWindow(QMainWindow):
             elif os.path.isfile(p):
                 files.append(p)
         known = {norm_path(it["path"]) for it in self.items.values()}
-        known |= {norm_path(it["cut"]["output"]) for it in self.items.values() if it.get("cut")}
+        known |= {norm_path(it["cut"]["output"]) for it in self.items.values() if (it.get("cut") or {}).get("output")}
         added = 0
         for f in files:
             f = os.path.abspath(f)
@@ -1259,8 +1266,9 @@ class MainWindow(QMainWindow):
         text_item.setToolTip((it.get("full_text") or "")[:1500])
         cut = it.get("cut")
         cut_item = self.table.item(r, C_CUT)
-        cut_item.setText(("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
-                         os.path.basename(cut["output"]) if cut else "")
+        cut_item.setText(("— всё вырезано" if cut.get("empty") else
+                          ("✓ " if (cut.get("verification") or {}).get("lossless") else "") +
+                          os.path.basename(cut["output"])) if cut else "")
         cut_item.setToolTip(f"в таблице: {cut['sheet']}" if cut and cut.get("sheet") else "")
         self._loading = False
 
@@ -1445,6 +1453,10 @@ class MainWindow(QMainWindow):
         cut = it.get("cut")
         if not cut:
             self.cut_info.setText("")
+            return
+        if cut.get("empty"):
+            self.cut_info.setText("Вырезается вся запись: сохранять нечего, файл не создан. Таймкоды записаны в таблицу "
+                                  "как у остальных, и «Вырезать все» этот файл больше не трогает.")
             return
         v = cut.get("verification") or {}
         folder = os.path.dirname(cut["output"])
@@ -1898,7 +1910,8 @@ class MainWindow(QMainWindow):
 
     def check_names(self, folder):
         self.qs.setValue("names_dir", folder)
-        sources = {norm_path(it["cut"]["output"]): it["path"] for it in self.items.values() if it.get("cut")}
+        sources = {norm_path(it["cut"]["output"]): it["path"] for it in self.items.values()
+                   if (it.get("cut") or {}).get("output")}
         self.net.add(0, "names", {"cfg": self.sheet_cfg, "folder": folder, "sources": sources,
                                   "lang": self.sheet_cfg.get("lang", "ru"),
                                   "cache_path": os.path.join(app_data_dir(), "titles.json")})
@@ -1918,7 +1931,7 @@ class MainWindow(QMainWindow):
                         pass
                 it["path"] = new
                 self.table.item(self._row_of(fid), C_FILE).setText(os.path.basename(it["path"]))
-            if it.get("cut") and norm_path(it["cut"]["output"]) in moved:
+            if (it.get("cut") or {}).get("output") and norm_path(it["cut"]["output"]) in moved:
                 it["cut"]["output"] = moved[norm_path(it["cut"]["output"])]
             self._refresh_row(fid)
         self._remember_seen([b for _, b in done])
@@ -2038,7 +2051,7 @@ class MainWindow(QMainWindow):
             return
         self._scanning = True
         known = {it["path"] for it in self.items.values()}
-        known |= {it["cut"]["output"] for it in self.items.values() if it.get("cut")}
+        known |= {it["cut"]["output"] for it in self.items.values() if (it.get("cut") or {}).get("output")}
         known |= set(self.seen)  # taken before: removed from the list since, or the list was lost
         watched = self._watched()
         if not watched:
@@ -2103,7 +2116,7 @@ class MainWindow(QMainWindow):
         folder = self.extra.get("out_dir") or os.path.join(os.path.dirname(it["path"]), "готово")
         name = f"{it['row']}{ext}"
         out = os.path.join(folder, name)
-        if os.path.exists(out) and os.path.abspath(out) != os.path.abspath((it.get("cut") or {}).get("output", "")):
+        if os.path.exists(out) and os.path.abspath(out) != os.path.abspath((it.get("cut") or {}).get("output") or "."):
             out = cutter.default_output(out, ext, suffix="", out_dir=folder)
         return out
 
@@ -2487,9 +2500,9 @@ class MainWindow(QMainWindow):
             else:
                 it["cut"] = res
                 ok = (res.get("verification") or {}).get("lossless")
-                log_event(f"вырезано: {os.path.basename(it['path'])} -> {res['output']} "
+                log_event(f"вырезано: {os.path.basename(it['path'])} -> {res['output'] or 'целиком, без файла'} "
                           f"(без потерь: {ok}, таблица: {res.get('sheet', '-')})")
-                it["status"] = "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
+                it["status"] = self._proper_status(dict(it, cut=dict(res, sheet=None)))
                 if res.get("sheet") == "записано":
                     it["status"] += ", в таблице ✓"
                     self._remember_written(res["sheet_update"])
@@ -2618,7 +2631,7 @@ class MainWindow(QMainWindow):
                             it["text"] if it["text"] is not None else res.get("timecodes", ""),
                             f"{top[0]} {top[1]:.0%}" if top else "",
                             "" if not res.get("topic") else ("медицинская" if res["topic"]["medical"] else "проверить"),
-                            it["cut"]["output"] if it.get("cut") else "", it["path"]])
+                            (it["cut"]["output"] or "всё вырезано") if it.get("cut") else "", it["path"]])
         self.status_text.setText(f"Сохранено: {path}")
 
     def _text_file(self, path):
@@ -2703,7 +2716,7 @@ class MainWindow(QMainWindow):
         cut = it.get("cut")
         if cut:
             ok = (cut.get("verification") or {}).get("lossless")
-            st = "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
+            st = "вырезано целиком" if cut.get("empty") else "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
             if cut.get("sheet") == "записано":
                 st += ", в таблице ✓"
             elif str(cut.get("sheet") or "").startswith("ошибка"):
