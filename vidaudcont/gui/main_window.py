@@ -48,7 +48,7 @@ SETTING_LABELS = {
     "accent": ("Определять акцент", None, None, None),
     "topic": ("Проверять тему (медицинская ли)", None, None, None),
     "dialogue": ("Определять, разговор ли это (два голоса по очереди)", None, None, None),
-    "only_suitable": ("«Вырезать все»: только разговоры на медицинскую тему с британским акцентом", None, None, None),
+    "only_suitable": ("«Вырезать все»: только подходящие по проверкам выше (акцент, тема, разговор)", None, None, None),
 }
 
 
@@ -1186,7 +1186,7 @@ class MainWindow(QMainWindow):
         t_item.setText("" if not topic else ("медицинская" if topic.get("medical") else "проверьте"))
         t_item.setForeground(QColor("#2e7d32") if topic and topic.get("medical") else QColor("#ef6c00"))
         fit_item = self.table.item(r, C_FIT)
-        why = suitability(res) if res else None
+        why = suitability(res, self.settings.dialogue) if res else None
         if it.get("skip"):
             fit_item.setText("✗ пропуск: " + ("красная строка" if "красным" in it["skip"] else "повтор"))
             fit_item.setForeground(QColor("#9e9e9e"))
@@ -1507,12 +1507,13 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
 
     def _check_dialogues(self):
-        """Files analysed before the conversation check existed get only that check (seconds, not a new analysis)."""
+        """Files analysed before the conversation check existed, or while it was turned off, get only that check
+        (seconds, not a new analysis)."""
         if not self.settings.dialogue:
             return
         for fid, it in self.items.items():
             res = it.get("result")
-            if res and "dialogue" not in res and res.get("segments") is not None and fid not in self._dialogue_pending \
+            if res and res.get("dialogue") is None and res.get("segments") is not None and fid not in self._dialogue_pending \
                     and not it.get("skip"):
                 self._dialogue_pending.add(fid)
                 self.pool.add(fid, it["path"], asdict(self.settings), kind="dialogue",
@@ -1888,7 +1889,7 @@ class MainWindow(QMainWindow):
         old = self.sheet_rows.get(it["row"], {})
         if self.sheet_cfg.get("overwrite") or not (old.get("cuts") or "").strip() or old.get("cuts", "").strip() == tc:
             upd["cuts"] = tc
-        why = suitability(it["result"] or {})
+        why = suitability(it["result"] or {}, self.settings.dialogue)
         if self.sheet_cfg.get("write_note", True) and why and not (old.get("note") or "").strip():
             upd["note"] = " + ".join(why)
         return upd if len(upd) > 1 else None
@@ -1929,7 +1930,7 @@ class MainWindow(QMainWindow):
                 if self.sheet_cfg.get("url"):  # they wait for their row: cut as "name_cut" they would be lost
                     continue
             if self.settings.only_suitable:
-                why = suitability(it["result"])
+                why = suitability(it["result"], self.settings.dialogue)
                 if why is None and self.settings.dialogue:
                     unchecked.append(os.path.basename(it["path"]))
                     continue
@@ -2354,6 +2355,9 @@ class MainWindow(QMainWindow):
             self.qs.setValue("settings", json.dumps(asdict(self.settings)))
             self.qs.setValue("extra", json.dumps(self.extra))
             self._configure_pool()
+            for fid in self.items:  # "Подходит" depends on which checks are on
+                self._refresh_row(fid)
+            self._check_dialogues()
             self.status_text.setText("Настройки сохранены. Новые пороги применятся при следующем анализе.")
 
     def export_csv(self):

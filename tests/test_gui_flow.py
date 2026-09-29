@@ -338,6 +338,57 @@ def test_cut_all_cuts_only_medical_conversations_with_british_accent(tmp_path, m
         sheet.close()
 
 
+def test_without_the_conversation_check_accent_and_topic_still_decide(tmp_path, monkeypatch):
+    """The conversation check turned off: an American recording is still not cut and gets its note in column E,
+    a British lecture is cut. Turned on again, files analysed without it get only that check."""
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    grid = [["", "", "Link", "", ""]] + [["", "", f"https://youtu.be/{c * 11}", "", ""] for c in "ABC"]
+    sheet = MockSheet(grid, key="k")
+    try:
+        from vidaudcont.gui.main_window import MainWindow
+        base = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [[5.0, 30.0]], "hints": [],
+                "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "speech_db": -20.0,
+                "topic": {"medical": True, "top_terms": ["pain"]}}
+        british = {"top": "британский", "groups": {"британский": 1.0}}
+        lecture = {"conversation": False, "separation": 0.07, "minor_share": 0.3, "turns_per_min": 6.0,
+                   "reason": "говорит в основном один человек"}
+        files = {"без проверки.m4a": (2, dict(base, accent=british, dialogue=None)),
+                 "лекция.m4a": (3, dict(base, accent=british, dialogue=lecture)),
+                 "американцы.m4a": (4, dict(base, accent={"top": "американский", "groups": {"американский": 1.0}},
+                                            dialogue=None))}
+        w = MainWindow()
+        w.settings.dialogue = False
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True}
+        fids = {}
+        for name, (row, res) in files.items():
+            shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
+            fids[name] = w._add_item(str(tmp_path / name), {"status": "готово", "result": res, "row": row,
+                                                            "row_how": "вручную"})
+        assert [w.table.item(r, 7).text() for r in range(3)] == ["✓ да", "✓ да", "✗ американский акцент"]
+        w.cut_all()
+        wait(app, lambda: w.worker.pending == 0 and w.net.pending == 0
+             and all(it.get("cut") or it.get("noted") for it in w.items.values()), timeout=300)
+        assert "Не подходят (1)" in asked[0] and "проверяются" not in asked[0]
+        assert sorted(os.listdir(tmp_path / "готово")) == ["2.m4a", "3.m4a"]
+        assert sheet.cell(2, 5) == "" and sheet.cell(3, 5) == "" and sheet.cell(4, 5) == "АМЕРИКАНСКИЙ АКЦЕНТ"
+
+        added = []
+        monkeypatch.setattr(w.pool, "add", lambda fid, path, settings, kind="analyze", extra=None:
+                            added.append((fid, kind)))
+        w.settings.dialogue = True
+        w._check_dialogues()
+        assert sorted(added) == sorted((fids[n], "dialogue") for n in ("без проверки.m4a", "американцы.m4a"))
+        w.close()
+    finally:
+        sheet.close()
+
+
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
     """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
     get "ПОВТОР строки N" in column E from the downloader dialog."""

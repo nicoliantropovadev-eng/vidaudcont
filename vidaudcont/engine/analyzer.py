@@ -55,7 +55,7 @@ class Settings:
     accent: bool = True
     topic: bool = True
     dialogue: bool = True       # tell a conversation (two voices taking turns) from a lecture or a voice-over
-    only_suitable: bool = True  # "Cut all" cuts only medical conversations with a British accent
+    only_suitable: bool = True  # "Cut all" cuts only what passes the checks turned on (accent, topic, conversation)
     threads: int = 0            # processor threads for analysis (0 = half of the logical cores)
 
 
@@ -677,19 +677,22 @@ def encounter(res):
     return e["encounter"] >= ENCOUNTER_MIN and e["encounter"] > e["lecture"]
 
 
-def suitability(res):
+def suitability(res, check_dialogue=True):
     """Why a recording is not a medical conversation (or examination) with a British accent; [] = it is one.
-    None when the conversation check has not been done for it yet."""
+    None when the conversation check has not been done for it yet, or nothing was checked at all.
+    check_dialogue=False (the check turned off in the settings): only the accent and the topic count."""
     d, t, a = res.get("dialogue"), res.get("topic"), res.get("accent")
-    if d is None:
+    if check_dialogue and d is None:
         return None
     why = []
-    if d.get("conversation") is False and not encounter(res):
+    if check_dialogue and d.get("conversation") is False and not encounter(res):
         why.append("НЕ РАЗГОВОР")
     if t and t.get("medical") is False:
         why.append("НЕ МЕДИЦИНСКАЯ ТЕМА")
     if a and a.get("top") and a["top"] != "британский":
         why.append(ACCENT_NOTE.get(a["top"], "НЕ БРИТАНСКИЙ АКЦЕНТ"))
+    if not why and not check_dialogue and not t and not (a and a.get("top")):
+        return None
     return why
 
 
