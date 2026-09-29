@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__, cutter
-from ..engine.analyzer import Settings, default_threads, find_phrases, merge_cuts, suitability, word_list
+from ..engine.analyzer import Settings, default_threads, final_cuts, find_phrases, suitability, word_list
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import (FolderWatcher, clean_link, first_rows, norm_path, parse_rows, repeats, select_links,
@@ -40,6 +40,8 @@ SETTING_LABELS = {
     "edge_min": ("Вырезать начало/конец без речи от, с", 0, 30, 0.5),
     "music_min": ("Вырезать музыку от, с", 0.5, 30, 0.5),
     "music_thr": ("Чувствительность к музыке (0.1–0.9, меньше = строже)", 0.1, 0.9, 0.05),
+    "bg_music": ("Вырезать тихую фоновую музыку под речью", None, None, None),
+    "bg_music_thr": ("… чувствительность к фоновой музыке (0.03–0.5, меньше = строже)", 0.03, 0.5, 0.01),
     "min_keep": ("Вырезать кусок речи между вырезами короче, с", 0, 60, 1),
     "quiet_enabled": ("Вырезать слишком тихую речь", None, None, None),
     "quiet_abs": ("… тихая речь: громкость ниже, дБ", -60, -10, 1),
@@ -924,7 +926,8 @@ COL_WIDTH = [220, 56, 56, 110, 250, 90, 95, 150, 80, 90]
 C_FILE, C_ROW, C_DUR, C_STATUS, C_TC, C_ACC, C_TOPIC, C_FIT, C_TEXT, C_CUT = range(10)
 CELL_MAX = 49000  # a Google Sheets cell holds at most 50 000 characters
 TEXTS_PER_WRITE = 20
-SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина"}
+SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина", "МУЗЫКА ПОД РЕЧЬЮ": "музыка"}
+MUSIC_ASIDE = "музыка под речью"  # results folder's subfolder for files cut before their background music was found
 MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
 CUT_THREADS = 4   # files cut at a time: a cut is mostly waiting (the disk, the table's answer), not the processor
 WAIT_ROW = "ждёт номера строки"       # rows are chosen for the analysis and this file's row is not known yet
@@ -1218,7 +1221,7 @@ class MainWindow(QMainWindow):
               "row": None, "row_how": ""}
         if state:
             it.update({k: state.get(k) for k in ("status", "result", "text", "cut", "row", "row_how", "noted", "skip",
-                                                 "full_text", "text_written", "text_only")
+                                                 "full_text", "text_written", "text_only", "recut")
                        if k in state and state.get(k) is not None})
         self.items[fid] = it
         self._loading = True
@@ -1410,6 +1413,16 @@ class MainWindow(QMainWindow):
 
     def _checks_html(self, res, it=None):
         out = []
+        bgm = res.get("bg_music") or {}
+        if bgm.get("found"):
+            out.append("<b>Фоновая музыка под речью:</b> " + ", ".join(
+                f"{fmt_time(x['start'])}–{fmt_time(x['end'], floor=True)}" for x in bgm["found"])
+                + f" — вырезается (под ней {bgm.get('share', 0):.0%} речи)")
+        elif bgm.get("thr") is not None:
+            out.append("<b>Фоновая музыка под речью:</b> не найдена")
+        if it is not None and it.get("recut"):
+            out.append("<span style='color:#c62828'><b>Вырезан раньше, чем нашлась фоновая музыка:</b> «Вырезать все» "
+                       "перережет его под тем же именем.</span>")
         w = res.get("words")
         if it is not None and self._needs_words(it):
             out.append("<b>Слова из списка:</b> ищутся — таймкоды обновятся сами (колонка «Текст» показывает ход)")
@@ -1506,7 +1519,7 @@ class MainWindow(QMainWindow):
         v = cut.get("verification") or {}
         folder = os.path.dirname(cut["output"])
         lines = [f"Сохранено: <a href='{folder}'>{os.path.basename(cut['output'])}</a> "
-                 f"({fmt_time(cut['output_duration'])} из {fmt_time(cut['source_duration'])})"]
+                 f"({fmt_time(cut.get('output_duration') or 0)} из {fmt_time(cut.get('source_duration') or 0)})"]
         if v.get("lossless"):
             if "identical_samples" in v.get("audio", {}):
                 lines.append("<span style='color:#2e7d32'>✓ Без потери качества: звук совпадает с исходным до последнего отсчёта.</span>")
@@ -1528,6 +1541,7 @@ class MainWindow(QMainWindow):
             self._queue_analysis(self.current)
 
     def analyze_all(self):
+        self._check_music()
         self._check_dialogues()
         self._check_words()
         self._check_texts()
@@ -1744,15 +1758,57 @@ class MainWindow(QMainWindow):
             if times is None:
                 return False
         found = find_phrases(times, entries, res["duration"], self.settings.words_phrase) if entries else []
-        base = res.setdefault("base_cuts", res["cuts"])
-        res["cuts"] = merge_cuts(base, found, res["duration"], self.settings) if found else base
-        res["timecodes"] = format_cuts([(c["start"], c["end"]) for c in res["cuts"]], res["duration"])
         res["words"] = {"list": entries, "phrase": self.settings.words_phrase, "found": found}
+        self._recompute_cuts(it)
         self._refresh_row(fid)
         if fid == self.current:
             self._show_details(fid)
         self._save_session()
         return True
+
+    def _recompute_cuts(self, it):
+        """The file's cuts again: the sound rules' cuts with the layers on top (quiet background music from the music
+        probability kept with the analysis, phrases with the listed words found before)."""
+        res = it["result"]
+        base = res.setdefault("base_cuts", res["cuts"])
+        res["cuts"], bg, share = final_cuts(base, res["duration"], self.settings, res.get("music_per_second"),
+                                            res.get("segments"), (res.get("words") or {}).get("found") or [])
+        res["timecodes"] = format_cuts([(c["start"], c["end"]) for c in res["cuts"]], res["duration"])
+        res["bg_music"] = {"thr": self.settings.bg_music_thr if self.settings.bg_music else None, "found": bg,
+                           "share": share}
+
+    def _music_done(self, res):
+        return "bg_music" in res and res["bg_music"].get("thr") == \
+            (self.settings.bg_music_thr if self.settings.bg_music else None)
+
+    def _check_music(self):
+        """Quiet background music found again in every analysed file from the music probability kept with its
+        analysis (no new analysis): files not cut yet get their timecodes again, cut ones whose timecodes change are
+        to be cut again («Вырезать все» does it)."""
+        changed, recut = 0, 0
+        for fid, it in self.items.items():
+            res = it.get("result")
+            if not res or self._music_done(res):
+                continue
+            before = res.get("timecodes")
+            self._recompute_cuts(it)
+            if res["timecodes"] != before:
+                changed += 1
+            cut = it.get("cut")
+            if cut and it["text"] is None and not it.get("recut") and res["timecodes"] != cut.get("timecodes") \
+                    and (res.get("bg_music") or {}).get("found"):
+                it["recut"] = True
+                it["status"] = self._proper_status(it)
+                recut += 1
+            self._refresh_row(fid)
+            if fid == self.current:
+                self._show_details(fid)
+        if changed or recut:
+            self._save_session()
+            log_event(f"фоновая музыка пересчитана: таймкоды изменились у {changed}, перерезать {recut}")
+            self.status_text.setText(f"Фоновая музыка под речью: таймкоды пересчитаны у {changed} файлов" + (
+                f"; уже вырезанных, которые нужно перерезать: {recut} — нажмите «Вырезать все»." if recut else "."))
+        return changed, recut
 
     def _check_words(self):
         """Files analysed before these words were looked for, not cut yet: the words are found again in the word times
@@ -1780,6 +1836,7 @@ class MainWindow(QMainWindow):
             for fid, it in self.items.items():
                 if it["result"] is None and it["status"] == "ожидает анализа":
                     self._auto_analyze(fid, wanted)
+        self._check_music()
         self._check_dialogues()
         self._check_words()
         self._check_texts()
@@ -2171,7 +2228,9 @@ class MainWindow(QMainWindow):
             return None
         upd = {"row": it["row"]}
         old = self.sheet_rows.get(it["row"], {})
-        if self.sheet_cfg.get("overwrite") or not (old.get("cuts") or "").strip() or old.get("cuts", "").strip() == tc:
+        mine = ((it.get("cut") or {}).get("timecodes") or "").strip()  # written by the program when it cut the file
+        have = (old.get("cuts") or "").strip()
+        if self.sheet_cfg.get("overwrite") or not have or have == tc or (mine and have == mine):
             upd["cuts"] = tc
         why = suitability(it["result"] or {}, self.settings.dialogue)
         if self.sheet_cfg.get("write_note", True) and why and not (old.get("note") or "").strip():
@@ -2202,9 +2261,9 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             fid = self.table.item(r, C_FILE).data(Qt.UserRole)
             it = self.items[fid]
-            if not it["result"] or (it.get("cut") and (it["status"].startswith("вырезано") or
-                                                       self._proper_status(it).startswith("вырезано") and
-                                                       it["text"] is None)):
+            if not it["result"] or (it.get("cut") and not it.get("recut") and
+                                    (it["status"].startswith("вырезано") or
+                                     self._proper_status(it).startswith("вырезано") and it["text"] is None)):
                 continue
             if it.get("skip"):
                 skipped.append(os.path.basename(it["path"]))
@@ -2247,6 +2306,10 @@ class MainWindow(QMainWindow):
             return
         with_row = sum(1 for fid, _, _ in todo if self.items[fid].get("row"))
         text = f"Будет обработано файлов: {len(todo)}.\n\n" if todo else ""
+        again = sum(1 for fid, _, _ in todo if self.items[fid].get("recut"))
+        if again:
+            text += (f"Из них перерезать заново (найдена фоновая музыка): {again} — прежние файлы с тем же именем "
+                     "заменятся, таймкоды в таблице обновятся.\n\n")
         if with_row:
             text += (f"{with_row} получат имя по номеру строки (например «{self.items[todo[0][0]].get('row') or 80}.m4a»)"
                      f" в папке «{self.extra.get('out_dir') or 'готово'}»")
@@ -2289,6 +2352,9 @@ class MainWindow(QMainWindow):
         updates, fids = [], []
         for fid, tc, why in unfit:
             it = self.items[fid]
+            if it.get("cut"):  # cut before its background music was found: that file has music in it
+                self._put_aside(it["cut"].get("output"))
+                it["cut"], it["recut"] = None, False
             it["status"] = "не подходит"
             self._refresh_row(fid)
             upd = self._sheet_update(it, tc)
@@ -2301,6 +2367,24 @@ class MainWindow(QMainWindow):
             self.net.add(0, "sheet", {"cfg": self.sheet_cfg, "updates": updates, "noted": fids})
             self.progress.setVisible(True)
         self._save_session()
+
+    def _put_aside(self, path):
+        """A result with background music in it is moved into a subfolder (not deleted)."""
+        if not path or not os.path.exists(path):
+            return None
+        folder = os.path.join(os.path.dirname(path), MUSIC_ASIDE)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            dest, n = os.path.join(folder, os.path.basename(path)), 2
+            while os.path.exists(dest):
+                base, ext = os.path.splitext(os.path.basename(path))
+                dest, n = os.path.join(folder, f"{base} ({n}){ext}"), n + 1
+            os.replace(path, dest)
+            log_event(f"с фоновой музыкой, убран в «{MUSIC_ASIDE}»: {path}")
+            return dest
+        except OSError as e:
+            log_event(f"не удалось убрать {path}: {e!r}")
+            return None
 
     def _after_fresh_rows(self, then):
         """Read the table again right before writing, so filled cells are never overwritten by accident. It is
@@ -2573,7 +2657,10 @@ class MainWindow(QMainWindow):
                 log_event(f"анализ: {os.path.basename(it['path'])} -> {res['timecodes']}")
                 QTimer.singleShot(0, self._check_texts)
             else:
-                it["cut"] = res
+                before = it.get("cut") or {}
+                if res.get("empty") and before.get("output"):  # cut again, and nothing is left: the old file goes
+                    self._put_aside(before["output"])
+                it["cut"], it["recut"] = res, False
                 ok = (res.get("verification") or {}).get("lossless")
                 log_event(f"вырезано: {os.path.basename(it['path'])} -> {res['output'] or 'целиком, без файла'} "
                           f"(без потерь: {ok}, таблица: {res.get('sheet', '-')})")
@@ -2687,6 +2774,7 @@ class MainWindow(QMainWindow):
             self._configure_pool()
             for fid in self.items:  # "Подходит" depends on which checks are on
                 self._refresh_row(fid)
+            self._check_music()  # another sensitivity to background music: timecodes again
             self._check_dialogues()
             self._check_words()  # another list of words: files not cut yet get their timecodes again
             self.status_text.setText("Настройки сохранены. Новые пороги применятся при следующем анализе.")
@@ -2792,6 +2880,8 @@ class MainWindow(QMainWindow):
         """The status a file should show from what is known about it (repairs one left by a transcription)."""
         cut = it.get("cut")
         if cut:
+            if it.get("recut"):
+                return "нужно перерезать: фоновая музыка"
             ok = (cut.get("verification") or {}).get("lossless")
             st = "вырезано целиком" if cut.get("empty") else "вырезано ✓" if ok else "вырезано (проверка не прошла!)"
             if cut.get("sheet") == "записано":
@@ -2815,12 +2905,13 @@ class MainWindow(QMainWindow):
             st = it["status"] if it["status"].startswith(("готово", "вырезано")) or it["result"] else \
                 (it["status"] if it["status"] == "ошибка" or it["status"].startswith("пропущен") or it.get("text_only")
                  else "ожидает анализа")
-            if it["result"] and not st.startswith(("готово", "вырезано")):
+            if it["result"] and not st.startswith(("готово", "вырезано", "нужно перерезать")):
                 st = "готово"
             data.append({"path": it["path"], "status": st, "result": it["result"], "text": it["text"], "cut": it["cut"],
                          "row": it.get("row"), "row_how": it.get("row_how", ""), "noted": it.get("noted", False),
                          "skip": it.get("skip"), "has_text": it.get("full_text") is not None,
-                         "text_written": it.get("text_written", False), "text_only": it.get("text_only", False)})
+                         "text_written": it.get("text_written", False), "text_only": it.get("text_only", False),
+                         "recut": it.get("recut", False)})
         self._write_seen()
         for it in self.items.values():  # transcripts not in their own file yet (e.g. from version 1.6)
             if it.get("full_text") is not None and not it.get("_text_stored"):

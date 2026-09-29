@@ -33,6 +33,10 @@ KIND_NO_SPEECH = "нет речи"
 KIND_MUSIC_UNDER = "музыка под речью"
 KIND_QUIET_SPEECH = "тихая речь"
 KIND_LEFTOVER = "короткий кусок между вырезами"
+KIND_BG_MUSIC = "фоновая музыка под речью"
+BG_MUSIC_WINDOW = 9     # seconds the music probability is averaged over: a music bed plays on, words come and go
+BG_MUSIC_MIN_RUN = 10   # ... and cut when it stays up this long
+UNFIT_MUSIC_SHARE = 0.5  # music under this share of the speech or more: the recording does not fit
 WORDS_DEFAULT = "YouTube, subscribe, video, channel, actor, exam"
 
 
@@ -42,6 +46,8 @@ class Settings:
     edge_min: float = 3.0       # silence/music before the first / after the last words is cut from this length
     music_min: float = 2.0      # music (between or under speech) from this length is cut
     music_thr: float = 0.30     # AudioSet "Music" probability treated as music
+    bg_music: bool = True       # quiet background music under speech is cut too (see background_music)
+    bg_music_thr: float = 0.10  # ... from this music probability averaged over BG_MUSIC_WINDOW s
     min_keep: float = 8.0       # speech left between two cuts shorter than this is cut as well
     quiet_enabled: bool = True  # cut stretches where people speak much more quietly than in the rest
     quiet_abs: float = -31.0    # ... speech level below this (dBFS, 90th pct of 30-ms speech frames) ...
@@ -750,6 +756,47 @@ def _snap(words, a, b, dur):
     return start, end
 
 
+def background_music(music_sec, segs, dur, st, base_cuts=()):
+    """Quiet music under the voices. A second of speech with music under it gets a low music probability that comes
+    and goes, too weak for the rule in find_cuts; averaged over BG_MUSIC_WINDOW s it stays up while the music plays
+    (with speech music was mixed under at -24/-30/-36 dB: 95/76/51 % of it found, against 77/57/20 % before; on the
+    user's 17 cut lists 5 s more of kept speech cut). Returns (cuts [{start, end, reason}], the share of the speech
+    with music under it, counting the music find_cuts cut in speech)."""
+    mu = np.asarray(music_sec if music_sec is not None else [], float)
+    n = len(mu)
+    sp = np.zeros(n, bool)
+    for s, e in segs or []:
+        sp[int(s):int(np.ceil(e))] = True
+    if n == 0 or not sp.any():
+        return [], 0.0
+    under = np.zeros(n, bool)
+    for c in base_cuts:
+        if KIND_MUSIC_UNDER in c.get("reasons", []):
+            under[int(c["start"]):int(np.ceil(c["end"]))] = True
+    cuts = []
+    if st.bg_music:
+        avg = np.convolve(mu, np.ones(BG_MUSIC_WINDOW) / BG_MUSIC_WINDOW, mode="same")
+        reach = BG_MUSIC_WINDOW // 2  # the average rises a few seconds after the music starts: take those seconds too
+        for a, b in runs((avg >= st.bg_music_thr) & sp, min_len=BG_MUSIC_MIN_RUN):
+            for _ in range(reach):
+                if a > 0 and mu[a - 1] >= st.bg_music_thr / 2:
+                    a -= 1
+            for _ in range(reach):
+                if b < n and mu[b] >= st.bg_music_thr / 2:
+                    b += 1
+            cuts.append({"start": float(a), "end": float(min(b, dur)), "reason": KIND_BG_MUSIC})
+            under[a:b] = True
+    return cuts, round(float((under & sp).sum() / sp.sum()), 3)
+
+
+def final_cuts(base_cuts, dur, st, music_sec=None, segs=None, phrases=()):
+    """The sound rules' cuts with the layers added on top: quiet background music, phrases with listed words.
+    Returns (cuts, background music cuts, share of the speech with music under it)."""
+    bg, share = background_music(music_sec, segs, dur, st, base_cuts)
+    extra = bg + list(phrases)
+    return (merge_cuts(base_cuts, extra, dur, st) if extra else list(base_cuts)), bg, share
+
+
 def merge_cuts(cuts, extra, dur, st):
     """The cuts of the sound rules with more cuts added (phrases with listed words), joined as find_cuts joins its
     own: closer than merge_gap, or less than min_keep of speech left between them."""
@@ -848,6 +895,8 @@ def suitability(res, check_dialogue=True):
         why.append("НЕ МЕДИЦИНСКАЯ ТЕМА")
     if a and a.get("top") and a["top"] != "британский":
         why.append(ACCENT_NOTE.get(a["top"], "НЕ БРИТАНСКИЙ АКЦЕНТ"))
+    if (res.get("bg_music") or {}).get("share", 0.0) >= UNFIT_MUSIC_SHARE:
+        why.append("МУЗЫКА ПОД РЕЧЬЮ")
     if not why and not check_dialogue and not t and not (a and a.get("top")):
         return None
     return why
@@ -890,7 +939,7 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
         full_text, word_times = transcribe_full(models, wav16, segs, words=True,
                                                 progress=lambda f: step(0.64 + 0.35 * f, "расшифровка речи"))
         found = find_phrases(word_times, entries, dur, st.words_phrase)
-    cuts = merge_cuts(base_cuts, found, dur, st) if found else base_cuts
+    cuts, bg_found, music_share = final_cuts(base_cuts, dur, st, music_sec, segs, found)
     transcript, topic = "", None
     if st.topic:
         if word_times is None:
@@ -905,8 +954,9 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
         "speech_ratio": round(sum(e - s for s, e in segs) / max(dur, 1e-9), 3),
         "speech_db": round(speech_db, 1),
         "cuts": cuts,
-        "base_cuts": base_cuts,  # without the phrases: the words found again when the list changes
+        "base_cuts": base_cuts,  # without the layers on top: found again when the settings change
         "words": {"list": entries, "phrase": st.words_phrase, "found": found} if entries else None,
+        "bg_music": {"thr": st.bg_music_thr if st.bg_music else None, "found": bg_found, "share": music_share},
         "full_text": full_text,    # the window moves these two into their own files
         "word_times": word_times,
         "timecodes": format_cuts([(c["start"], c["end"]) for c in cuts], dur),

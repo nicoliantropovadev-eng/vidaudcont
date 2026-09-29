@@ -657,6 +657,59 @@ def test_rows_checked_again_by_length_are_corrected_and_reported(tmp_path, monke
         sheet.close()
 
 
+def test_files_cut_before_their_background_music_was_found_are_cut_again(tmp_path, monkeypatch):
+    """Background music found from the music probability kept with the analysis: a cut file whose timecodes change is
+    cut again under its name and its column D replaced; one with music under most of the speech does not fit: its
+    old result goes aside and column E says why."""
+    from .mock_sheet import MockSheet
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"a window: {a[2] if len(a) > 2 else a}"))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    grid = [["", "", "Link", "", ""], ["", "", "https://youtu.be/AAAAAAAAAAA", "start-0:05", ""],
+            ["", "", "https://youtu.be/BBBBBBBBBBB", "start-0:05", ""]]
+    sheet = MockSheet(grid, key="k")
+    try:
+        from vidaudcont.gui.main_window import MUSIC_ASIDE, MainWindow
+        w = MainWindow()
+        w.settings.words, w.settings.dialogue = "", False
+        w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True}
+        done = tmp_path / "готово"
+        done.mkdir()
+        fids = {}
+        for row, music in ((2, [0.0] * 30 + [0.13] * 30 + [0.0] * 16), (3, [0.2] * 76)):
+            src = tmp_path / f"{row}src.m4a"
+            shutil.copy(resources.asset("selftest.m4a"), src)
+            shutil.copy(resources.asset("selftest.m4a"), done / f"{row}.m4a")      # cut before, music and all
+            res = {"duration": 76.0, "speech_ratio": 0.9, "timecodes": "start-0:05", "segments": [[5.0, 76.0]],
+                   "hints": [], "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["тишина"]}], "transcript": "",
+                   "accent": None, "topic": None, "dialogue": None, "music_per_second": music}
+            fids[row] = w._add_item(str(src), {"status": "вырезано ✓, в таблице ✓", "result": res, "row": row,
+                                               "row_how": "вручную",
+                                               "cut": {"output": str(done / f"{row}.m4a"), "timecodes": "start-0:05",
+                                                       "sheet": "записано", "verification": {"lossless": True},
+                                                       "output_duration": 71.0, "source_duration": 76.0}})
+        assert w._check_music() == (2, 2)
+        a, b = w.items[fids[2]], w.items[fids[3]]
+        assert a["recut"] and b["recut"] and a["status"] == "нужно перерезать: фоновая музыка"
+        assert a["result"]["timecodes"] == "start-0:05, 0:30-1:00"
+        w.cut_all()
+        assert "перерезать заново (найдена фоновая музыка): 1" in asked[-1]
+        wait(app, lambda: a["cut"]["timecodes"] == "start-0:05, 0:30-1:00" and w.worker.pending == 0
+             and w.net.pending == 0, timeout=120)
+        assert not a.get("recut") and a["cut"]["output"] == str(done / "2.m4a")
+        assert abs(a["cut"]["output_duration"] - 41.0) < 0.3
+        assert sheet.cell(2, 4) == "start-0:05, 0:30-1:00"                       # the program's own value replaced
+        wait(app, lambda: sheet.cell(3, 5) == "МУЗЫКА ПОД РЕЧЬЮ" and w.net.pending == 0, timeout=60)
+        assert b["status"] == "не подходит" and b.get("cut") is None
+        assert (done / MUSIC_ASIDE / "3.m4a").exists() and not (done / "3.m4a").exists()
+        w.close()
+    finally:
+        sheet.close()
+
+
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
     """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
     get "ПОВТОР строки N" in column E from the downloader dialog."""

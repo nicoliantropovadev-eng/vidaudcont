@@ -85,3 +85,29 @@ def test_cuts_join_like_the_sound_rules():
     assert [(c["start"], c["end"]) for c in cuts] == [(0.0, 12.0), (30.0, 33.0), (60.0, 70.0)]
     assert "короткий кусок между вырезами" in cuts[0]["reasons"] and "тишина" in cuts[0]["reasons"]
     assert merge_cuts(base, [], 100.0, st) == [dict(c, reasons=sorted(c["reasons"])) for c in base]
+
+
+def test_quiet_background_music_under_speech_is_found():
+    import numpy as np
+
+    from vidaudcont.engine.analyzer import background_music, final_cuts, suitability
+    st = Settings()
+    speech = [[5.0, 115.0]]
+    bed = np.zeros(120)
+    bed[30:80] = 0.13                                   # quiet music under the voices from 0:30 to 1:20
+    cuts, share = background_music(bed, speech, 120.0, st)
+    assert [(c["start"], c["end"]) for c in cuts] == [(30.0, 80.0)] and share == round(50 / 110, 3)
+    spikes = np.zeros(120)
+    spikes[::7] = 0.5                                   # a word now and then that sounds a little like music
+    assert background_music(spikes, speech, 120.0, st) == ([], 0.0)
+    short = np.zeros(120)
+    short[30:37] = 0.2                                  # a jingle: the rule of find_cuts decides about it
+    assert background_music(short, speech, 120.0, st)[0] == []
+    assert background_music(bed, speech, 120.0, Settings(bg_music=False)) == ([], 0.0)
+    under = [{"start": 90.0, "end": 100.0, "reasons": ["музыка под речью"]}]
+    assert background_music(np.zeros(120), speech, 120.0, st, under)[1] == round(10 / 110, 3)
+    merged, bg, _ = final_cuts([{"start": 0.0, "end": 5.0, "reasons": ["тишина"]}], 120.0, st, bed, speech)
+    assert [(c["start"], c["end"]) for c in merged] == [(0.0, 5.0), (30.0, 80.0)] and bg == cuts
+    everywhere = np.full(120, 0.2)
+    res = {"bg_music": {"share": background_music(everywhere, speech, 120.0, st)[1]}, "dialogue": None}
+    assert "МУЗЫКА ПОД РЕЧЬЮ" in suitability(res, check_dialogue=False)
