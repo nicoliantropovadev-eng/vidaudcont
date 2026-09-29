@@ -309,6 +309,7 @@ def test_cut_all_cuts_only_medical_conversations_with_british_accent(tmp_path, m
                  "американцы.m4a": (4, dict(base, accent={"top": "американский", "groups": {"американский": 1.0}},
                                             dialogue=talk))}
         w = MainWindow()
+        w.settings.words = ""  # made-up results: no transcription to look for words in
         w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True}
         for name, (row, res) in files.items():
             shutil.copy(resources.asset("selftest.m4a"), tmp_path / name)
@@ -364,6 +365,7 @@ def test_without_the_conversation_check_accent_and_topic_still_decide(tmp_path, 
                                             dialogue=None))}
         w = MainWindow()
         w.settings.dialogue = False
+        w.settings.words = ""
         w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru", "write_note": True}
         fids = {}
         for name, (row, res) in files.items():
@@ -387,6 +389,71 @@ def test_without_the_conversation_check_accent_and_topic_still_decide(tmp_path, 
         w.close()
     finally:
         sheet.close()
+
+
+@pytest.mark.skipif(not os.path.isdir(resources.models_dir()), reason="models not downloaded")
+def test_phrases_with_listed_words_are_cut_and_found_again_when_the_list_changes(tmp_path, monkeypatch):
+    """The analysis cuts the sentences with a listed word and keeps the transcript; another list finds the words again
+    in the kept word times at once; a file analysed before the words were looked for waits for its transcription."""
+    from vidaudcont.engine.analyzer import Settings
+    from vidaudcont.gui.main_window import MainWindow, SettingsDialog
+    from vidaudcont.timecodes import format_cuts
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"error dialog: {a[2] if len(a) > 2 else a}"))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    dlg = SettingsDialog(Settings(words="rainbow, exam"), {})
+    assert dlg.widgets["words"].text() == "rainbow, exam"
+    dlg.widgets["words"].setText(" chillies ")
+    assert dlg.values()[0].words == "chillies"
+    dlg._reset()
+    assert dlg.values()[0].words == Settings().words
+
+    src = str(tmp_path / "клип.m4a")
+    shutil.copy(resources.asset("selftest.m4a"), src)
+    w = MainWindow()
+    w.settings.words = "rainbow"
+    w.add_paths([src])
+    fid = next(iter(w.items))
+    w._queue_analysis(fid)
+    wait(app, lambda: w.items[fid]["result"] is not None or w.items[fid]["status"] == "ошибка")
+    it = w.items[fid]
+    res = it["result"]
+    assert "full_text" not in res and "word_times" not in res          # kept in their own files, not in the list
+    assert "rainbow" in it["full_text"] and os.path.exists(w._words_file(src))
+    [found] = res["words"]["found"]
+    assert found["word"] == "rainbow" and found["end"] - found["start"] <= 8
+    assert any(c["start"] <= found["start"] and found["end"] <= c["end"] and "фраза со словом «rainbow»" in c["reasons"]
+               for c in res["cuts"])
+    assert res["timecodes"] != format_cuts([(c["start"], c["end"]) for c in res["base_cuts"]], res["duration"])
+
+    monkeypatch.setattr(w.pool, "add", lambda *a, **k: pytest.fail("no new transcription is needed"))
+    w.settings.words = "Airlines"                                       # another list: found in the kept word times
+    w._check_words()
+    assert [f["word"] for f in res["words"]["found"]] == ["Airlines"] and res["words"]["list"] == ["airlines"]
+    w.settings.words = ""                                               # no words: the sound rules alone
+    w._check_words()
+    assert res["cuts"] == res["base_cuts"] and not w._needs_words(it)
+
+    queued = []
+    monkeypatch.setattr(w.pool, "add", lambda fid, path, settings, kind="analyze", extra=None:
+                        queued.append((fid, kind, (extra or {}).get("words"))))
+    old = str(tmp_path / "раньше.m4a")                                  # analysed by an older version
+    shutil.copy(resources.asset("selftest.m4a"), old)
+    before = {k: v for k, v in res.items() if k not in ("words", "base_cuts")}
+    older = w._add_item(old, {"status": "готово", "result": dict(before, cuts=list(res["base_cuts"])), "row": 5})
+    w.settings.words = "rainbow"
+    w._check_words()
+    assert (older, "transcribe", True) in queued and fid not in [q[0] for q in queued]  # fid: word times kept
+    assert w._needs_words(w.items[older]) and not w._needs_words(it)
+    w.cut_all()
+    assert "Ещё проверяются (1)" in asked[-1]
+    w.on_done(older, "transcribe", {"text": it["full_text"], "word_times": w._load_words(it)})
+    assert not w._needs_words(w.items[older])
+    assert w.items[older]["result"]["timecodes"] == res["timecodes"]
+    w.close()
 
 
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
@@ -414,6 +481,7 @@ def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
                "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "accent": None, "topic": None}
         w = MainWindow()
         w.settings.only_suitable = False
+        w.settings.words = ""
         w.sheet_cfg = {"url": sheet.url, "key": "k", "lang": "ru"}
         fids = {}
         for name in ("Разговор один.m4a", "Разговор один (1).m4a", "Разговор два.m4a"):

@@ -66,8 +66,10 @@ def _worker_main(conn, threads):
                 wav = load_audio(job["path"], 16000)
                 segs = job.get("segments") or speech_segments(models, wav)
                 conn.send(("progress", 0.08, "расшифровка"))
-                res = {"text": transcribe_full(models, wav, segs,
-                                               progress=lambda f: conn.send(("progress", 0.08 + 0.92 * f, "расшифровка")))}
+                out = transcribe_full(models, wav, segs, words=bool(job.get("words")),
+                                      progress=lambda f: conn.send(("progress", 0.08 + 0.92 * f, "расшифровка")))
+                # words: with the time of each word too, to cut the phrases with listed words
+                res = {"text": out[0], "word_times": out[1]} if job.get("words") else {"text": out}
             else:
                 res = analyze(job["path"], models, Settings(**job["settings"]),
                               progress=lambda f, t: conn.send(("progress", float(f), t)))
@@ -80,7 +82,7 @@ class AnalysisPool:
     """A queue of analyses served by up to `workers` processes. The callbacks are called from the pool's
     threads: on_progress(fid, fraction, text), on_done(fid, kind, result), on_failed(fid, kind, message).
     kind is "analyze" (the whole analysis), "dialogue" (only the conversation check) or "transcribe" (the whole
-    recording as text)."""
+    recording as text; with extra {"words": True} also the time of each word)."""
 
     def __init__(self, on_progress, on_done, on_failed):
         self.on_progress, self.on_done, self.on_failed = on_progress, on_done, on_failed

@@ -98,6 +98,12 @@ def selftest(out_json=None, gui=False):
             check(f"речь {a}-{b} с сохранена", cover(a, b) <= 0.2, f"вырезано {cover(a, b):.0%}")
         check("акцент британский", r["accent"] and r["accent"]["top"] == "британский", r["accent"] and r["accent"]["groups"])
         check("расшифровка для темы", bool(r["transcript"].strip()), r["transcript"][:80])
+        from .engine.analyzer import find_phrases
+        wt = r.get("word_times") or []
+        said = [w for w in wt if "carrot" in w[2].lower()]
+        found = find_phrases(wt, ["carrot"], r["duration"])
+        check("время каждого слова (вырезание фраз со словами)",
+              said and found and found[0]["start"] <= said[0][0] < said[0][1] <= found[0]["end"], found[:1] or wt[:5])
         d = r.get("dialogue") or {}
         check("проверка «разговор или нет»", "separation" in d, d)
         from .engine.analyzer import load_audio, speech_segments, transcribe_full
@@ -191,6 +197,7 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("--transcribe-clips", nargs=2, metavar=("CLIPS_NPZ", "OUT_JSON"), help=argparse.SUPPRESS)
     ap.add_argument("--threads", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--words", action="store_true", help=argparse.SUPPRESS)  # with --transcribe-clips: word times too
     a = ap.parse_args(argv)
 
     if a.transcribe_clips:  # helper process: Whisper only, torch is never imported here
@@ -202,7 +209,7 @@ def main(argv=None):
             clips = [z[k] for k in sorted(z.files, key=lambda k: int(k.split("_")[1]))]
         model = load_whisper(resources.models_dir(), a.threads or max(1, (os.cpu_count() or 2) - 1))
         with open(dst, "w", encoding="utf-8") as f:
-            json.dump(transcribe(model, clips), f, ensure_ascii=False)
+            json.dump(transcribe(model, clips, words=a.words), f, ensure_ascii=False)
         return 0
 
     if a.selftest or a.selftest_gui:

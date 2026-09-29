@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__, cutter
-from ..engine.analyzer import Settings, default_threads, suitability
+from ..engine.analyzer import Settings, default_threads, find_phrases, merge_cuts, suitability, word_list
 from ..engine.pool import AnalysisPool
 from ..applog import log_event
 from ..downloads import (FolderWatcher, clean_link, first_rows, norm_path, parse_rows, repeats, select_links,
@@ -44,6 +44,8 @@ SETTING_LABELS = {
     "quiet_enabled": ("Вырезать слишком тихую речь", None, None, None),
     "quiet_abs": ("… тихая речь: громкость ниже, дБ", -60, -10, 1),
     "quiet_rel": ("… и тише остальной записи на, дБ", -30, 0, 1),
+    "words": ("Вырезать фразы со словами", None, None, None),
+    "words_phrase": ("… всю фразу со словом, а не только слово", None, None, None),
     "threads": ("Потоков процессора для анализа (0 = половина)", 0, 64, 1),
     "accent": ("Определять акцент", None, None, None),
     "topic": ("Проверять тему (медицинская ли)", None, None, None),
@@ -258,6 +260,13 @@ class SettingsDialog(QDialog):
             if isinstance(val, bool):
                 w = QCheckBox()
                 w.setChecked(val)
+            elif isinstance(val, str):
+                w = QLineEdit(val)
+                w.setMinimumWidth(360)
+                w.setPlaceholderText("пусто — не искать слова")
+                w.setToolTip("Через запятую. Формы слова находятся сами: video — videos, subscribe — subscribed, "
+                             "subscribers.\nЗвёздочка — любое окончание: subscri*. Можно и несколько слов подряд: "
+                             "like and subscribe.")
             else:
                 w = QDoubleSpinBox()
                 w.setRange(lo, hi)
@@ -293,13 +302,20 @@ class SettingsDialog(QDialog):
         default = Settings()
         for name, w in self.widgets.items():
             v = getattr(default, name)
-            w.setChecked(v) if isinstance(w, QCheckBox) else w.setValue(v)
+            if isinstance(w, QCheckBox):
+                w.setChecked(v)
+            elif isinstance(w, QLineEdit):
+                w.setText(v)
+            else:
+                w.setValue(v)
 
     def values(self):
         st = Settings()
         for name, w in self.widgets.items():
             if isinstance(w, QCheckBox):
                 setattr(st, name, w.isChecked())
+            elif isinstance(w, QLineEdit):
+                setattr(st, name, w.text().strip())
             else:
                 setattr(st, name, int(w.value()) if isinstance(getattr(st, name), int) else float(w.value()))
         return st, {"out_dir": self.out_dir.text().strip(), "suffix": self.suffix.text() or "_cut"}
@@ -1291,7 +1307,7 @@ class MainWindow(QMainWindow):
                 for col, val in enumerate([fmt_time(c["start"]), fmt_time(c["end"], floor=True),
                                            f"{c['end'] - c['start']:.0f} с", ", ".join(c["reasons"])]):
                     self.reasons.setItem(r, col, QTableWidgetItem(val))
-            self.checks.setText(self._checks_html(res))
+            self.checks.setText(self._checks_html(res, it))
             self.transcript.setPlainText(it.get("full_text") or res.get("transcript") or "")
         self._update_timeline()
         self._show_cut_info(it)
@@ -1302,8 +1318,19 @@ class MainWindow(QMainWindow):
                 it["has_video"] = False
         self.mode.setVisible(it["has_video"])
 
-    def _checks_html(self, res):
+    def _checks_html(self, res, it=None):
         out = []
+        w = res.get("words")
+        if it is not None and self._needs_words(it):
+            out.append("<b>Слова из списка:</b> ищутся — таймкоды обновятся сами (колонка «Текст» показывает ход)")
+        elif w and w.get("list"):
+            out.append("<b>Слова из списка:</b> " + (
+                ", ".join(f"«{x['word']}» {fmt_time(x['start'])}–{fmt_time(x['end'], floor=True)}" for x in w["found"])
+                + (" — вырезаются целыми фразами" if w.get("phrase") else " — вырезаются") if w["found"]
+                else "не найдены"))
+        elif it is not None and it.get("cut") and word_list(self.settings.words) and not self._words_done(res):
+            out.append("<b>Слова из списка:</b> файл вырезан раньше, чем их стали искать. Чтобы убрать и их, нажмите "
+                       "«Анализировать» и вырежьте файл заново.")
         acc = res.get("accent")
         if acc:
             groups = ", ".join(f"{k} {v:.0%}" for k, v in acc["groups"].items())
@@ -1408,6 +1435,7 @@ class MainWindow(QMainWindow):
 
     def analyze_all(self):
         self._check_dialogues()
+        self._check_words()
         self._check_texts()
         n = 0
         for fid, it in self.items.items():
@@ -1457,7 +1485,8 @@ class MainWindow(QMainWindow):
                 continue
             segs = (it.get("result") or {}).get("segments")
             self._text_pending.add(fid)
-            self.pool.add(fid, it["path"], asdict(self.settings), kind="transcribe", extra={"segments": segs})
+            self.pool.add(fid, it["path"], asdict(self.settings), kind="transcribe",
+                          extra={"segments": segs, "words": self._needs_words(it)})
             self._refresh_row(fid)
             self.progress.setVisible(True)
 
@@ -1520,6 +1549,51 @@ class MainWindow(QMainWindow):
                               extra={"segments": res["segments"]})
                 self.progress.setVisible(True)
 
+    def _words_done(self, res):
+        """The phrases with the listed words are among the file's cuts (or no words are listed)."""
+        entries = word_list(self.settings.words)
+        w = res.get("words") or {"list": [], "phrase": self.settings.words_phrase}
+        return w["list"] == entries and (not entries or w.get("phrase") == self.settings.words_phrase)
+
+    def _needs_words(self, it):
+        """An analysed file not cut yet whose timecodes lack the phrases with the listed words (unless edited by hand)."""
+        res = it.get("result")
+        return bool(res and not it.get("cut") and not it.get("skip") and it["text"] is None
+                    and not self._words_done(res))
+
+    def _apply_words(self, fid, times=None):
+        """The file's cuts again with the phrases of the listed words, found in its word times (kept since its
+        transcription). False: the file has no word times stored, it needs a transcription."""
+        it = self.items[fid]
+        res = it["result"]
+        entries = word_list(self.settings.words)
+        if entries and times is None:
+            times = self._load_words(it)
+            if times is None:
+                return False
+        found = find_phrases(times, entries, res["duration"], self.settings.words_phrase) if entries else []
+        base = res.setdefault("base_cuts", res["cuts"])
+        res["cuts"] = merge_cuts(base, found, res["duration"], self.settings) if found else base
+        res["timecodes"] = format_cuts([(c["start"], c["end"]) for c in res["cuts"]], res["duration"])
+        res["words"] = {"list": entries, "phrase": self.settings.words_phrase, "found": found}
+        self._refresh_row(fid)
+        if fid == self.current:
+            self._show_details(fid)
+        self._save_session()
+        return True
+
+    def _check_words(self):
+        """Files analysed before these words were looked for, not cut yet: the words are found again in the word times
+        kept from their transcription, or the file gets a transcription (not a new analysis)."""
+        for fid, it in self.items.items():
+            if not self._needs_words(it) or fid in self._text_pending or self._apply_words(fid):
+                continue
+            self._text_pending.add(fid)
+            self.pool.add(fid, it["path"], asdict(self.settings), kind="transcribe",
+                          extra={"segments": it["result"].get("segments"), "words": True})
+            self._refresh_row(fid)
+            self.progress.setVisible(True)
+
     def _configure_pool(self):
         """Several files at once: the processor threads from the settings are shared between them."""
         n, each = self.pool.configure(self.settings.threads or default_threads())
@@ -1532,6 +1606,7 @@ class MainWindow(QMainWindow):
                 if it["result"] is None and it["status"] == "ожидает анализа":
                     self._queue_analysis(fid)
         self._check_dialogues()
+        self._check_words()
         self._check_texts()
         self.text_timer.start(3000)
         if self.sheet_cfg.get("url") and any(not it.get("row") and it.get("row_how") != "вручную"
@@ -1717,7 +1792,13 @@ class MainWindow(QMainWindow):
         moved = {norm_path(a): b for a, b in done}
         for fid, it in self.items.items():
             if norm_path(it["path"]) in moved:
-                it["path"] = moved[norm_path(it["path"])]
+                new = moved[norm_path(it["path"])]
+                for name in (self._text_file, self._words_file):  # kept under the file's new name
+                    try:
+                        os.replace(name(it["path"]), name(new))
+                    except OSError:
+                        pass
+                it["path"] = new
                 self.table.item(self._row_of(fid), C_FILE).setText(os.path.basename(it["path"]))
             if it.get("cut") and norm_path(it["cut"]["output"]) in moved:
                 it["cut"]["output"] = moved[norm_path(it["cut"]["output"])]
@@ -1929,6 +2010,9 @@ class MainWindow(QMainWindow):
                 no_row.append(os.path.basename(it["path"]))
                 if self.sheet_cfg.get("url"):  # they wait for their row: cut as "name_cut" they would be lost
                     continue
+            if self._needs_words(it):  # its timecodes get the phrases with the listed words first
+                unchecked.append(os.path.basename(it["path"]))
+                continue
             if self.settings.only_suitable:
                 why = suitability(it["result"], self.settings.dialogue)
                 if why is None and self.settings.dialogue:
@@ -1964,8 +2048,8 @@ class MainWindow(QMainWindow):
                      if self.sheet_cfg.get("url") else "") + ":\n  " + "\n  ".join(names[:8])
                      + ("\n  …" if len(names) > 8 else "") + "\n")
         if unchecked:
-            text += (f"\nЕщё проверяются, разговор ли это ({len(unchecked)}) — вырежутся при следующем нажатии, "
-                     "если подойдут.\n")
+            text += (f"\nЕщё проверяются ({len(unchecked)}): разговор ли это, нет ли слов из списка — вырежутся при "
+                     "следующем нажатии, если подойдут.\n")
         if skipped:
             text += f"\nПропускаются: строка отмечена красным или повтор ({len(skipped)}).\n"
         if bad:
@@ -2165,9 +2249,16 @@ class MainWindow(QMainWindow):
             self._text_pending.discard(fid)
             it = self.items.get(fid)
             if it:
-                it["full_text"], it["text_written"] = res["text"], False
+                if not (it.get("full_text") is not None and it.get("text_written")):  # one in the table stays
+                    it["full_text"], it["text_written"] = res["text"], False
+                    self._store_text(it)
                 it.pop("text_progress", None)
-                self._store_text(it)
+                if res.get("word_times") is not None:
+                    self._store_words(it, res["word_times"])
+                    if self._needs_words(it):
+                        self._apply_words(fid, res["word_times"])
+                elif self._needs_words(it):  # transcribed for the table before the words were wanted
+                    QTimer.singleShot(0, self._check_words)
                 if it.get("text_only") and it["result"] is None:
                     it["status"] = "расшифровано"
                 self._refresh_row(fid)
@@ -2243,8 +2334,16 @@ class MainWindow(QMainWindow):
             return
         if it is not None:
             if kind == "analyze":
+                text, times = res.pop("full_text", None), res.pop("word_times", None)
                 it["result"], it["text"], it["cut"] = res, None, None
                 it["status"] = "готово"
+                if times is not None:
+                    self._store_words(it, times)
+                if text is not None and not (it.get("full_text") is not None and it.get("text_written")):
+                    it["full_text"], it["text_written"] = text, False  # the transcript comes with the analysis
+                    self._store_text(it)
+                    if not self.text_timer.isActive():
+                        self.text_timer.start(5000)
                 log_event(f"анализ: {os.path.basename(it['path'])} -> {res['timecodes']}")
                 QTimer.singleShot(0, self._check_texts)
             else:
@@ -2358,6 +2457,7 @@ class MainWindow(QMainWindow):
             for fid in self.items:  # "Подходит" depends on which checks are on
                 self._refresh_row(fid)
             self._check_dialogues()
+            self._check_words()  # another list of words: files not cut yet get their timecodes again
             self.status_text.setText("Настройки сохранены. Новые пороги применятся при следующем анализе.")
 
     def export_csv(self):
@@ -2384,6 +2484,24 @@ class MainWindow(QMainWindow):
         d = os.path.join(app_data_dir(), "texts")
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, hashlib.sha1(norm_path(path).encode("utf-8")).hexdigest()[:20] + ".txt")
+
+    def _words_file(self, path):
+        return self._text_file(path)[:-4] + ".words.json"
+
+    def _store_words(self, it, times):
+        """The time of each word: the listed words are found again from these when the list changes."""
+        try:
+            with open(self._words_file(it["path"]), "w", encoding="utf-8") as f:
+                json.dump(times, f, ensure_ascii=False, separators=(",", ":"))
+        except OSError as e:
+            log_event(f"не удалось сохранить слова расшифровки: {e!r}")
+
+    def _load_words(self, it):
+        try:
+            with open(self._words_file(it["path"]), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def _store_text(self, it):
         """The transcript goes to its own file once; the saved list only says there is one."""

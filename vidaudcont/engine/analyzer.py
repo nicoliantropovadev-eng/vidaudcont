@@ -3,6 +3,7 @@
 Pipeline for one file:
   audio (phase-aware mono) -> speech segments (Silero VAD) -> per-second AudioSet tags (EfficientAT)
   -> breaks: intro/outro, pauses > max_gap, music, quiet speech, short leftovers -> cut list
+  + phrases with listed words ("subscribe", "YouTube"…: Whisper with word times) -> cut as well
   + accent vote (CommonAccent ECAPA) + topic hint (Whisper excerpts + medical vocabulary).
 The rules and thresholds were tuned against the user's manual cut lists (sheet rows 5-69).
 """
@@ -10,6 +11,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,7 @@ KIND_NO_SPEECH = "нет речи"
 KIND_MUSIC_UNDER = "музыка под речью"
 KIND_QUIET_SPEECH = "тихая речь"
 KIND_LEFTOVER = "короткий кусок между вырезами"
+WORDS_DEFAULT = "YouTube, subscribe, video, channel, actor, exam"
 
 
 @dataclass
@@ -52,6 +55,8 @@ class Settings:
     other_min: float = 0.0      # cut prominent sounds from this length (0 = only via max_gap)
     short_gap: float = 5.0      # pauses short_gap..max_gap are listed as a hint (not cut)
     merge_gap: float = 1.0      # cuts closer than this are merged
+    words: str = WORDS_DEFAULT  # phrases with these words are cut (comma-separated; forms like "videos" count too)
+    words_phrase: bool = True   # ... the whole phrase (sentence) with the word, not only the word itself
     accent: bool = True
     topic: bool = True
     dialogue: bool = True       # tell a conversation (two voices taking turns) from a lecture or a voice-over
@@ -541,23 +546,36 @@ def accent_vote(models, wav16, chunks, max_chunks=80):
             "top": groups.most_common(1)[0][0], "non_british": other}
 
 
-def transcribe(model, clips, progress=None):
-    """Whisper text of each clip (16 kHz float32 arrays)."""
+def transcribe(model, clips, progress=None, words=False):
+    """Whisper text of each clip (16 kHz float32 arrays). words=True: [text, [[start, end, word, probability], …]]
+    for each clip instead, the times in seconds from the start of the clip.
+    Clips up to 30 s (pieces of speech) are decoded once each, as a whole: the usual decoding goes over the end of
+    a clip a second time, which with word times took twice as long (measured: 46 s against 22 s for 213 s of speech)."""
+    from faster_whisper import BatchedInferencePipeline
+    whole = BatchedInferencePipeline(model) if all(len(c) <= 30 * 16000 for c in clips) else None
     out = []
     for i, clip in enumerate(clips):
-        seg_iter, _ = model.transcribe(clip, language="en", beam_size=1, vad_filter=False,
-                                       condition_on_previous_text=False)
-        out.append(" ".join(x.text.strip() for x in seg_iter))
+        if whole is not None:
+            seg_iter, _ = whole.transcribe(clip, language="en", beam_size=1, word_timestamps=words, batch_size=1,
+                                           clip_timestamps=[{"start": 0.0, "end": len(clip) / 16000}])
+        else:
+            seg_iter, _ = model.transcribe(clip, language="en", beam_size=1, vad_filter=False,
+                                           condition_on_previous_text=False, word_timestamps=words)
+        segs = list(seg_iter)
+        text = " ".join(x.text.strip() for x in segs)
+        out.append([text, [[round(float(w.start), 2), round(float(w.end), 2), w.word, round(float(w.probability), 2)]
+                           for x in segs for w in x.words or []]] if words else text)
         if progress:
             progress((i + 1) / len(clips))
     return out
 
 
-def _transcribe_in_subprocess(models, clips):
+def _transcribe_in_subprocess(models, clips, words=False):
     with tempfile.TemporaryDirectory(prefix="vidaudcont-asr-") as d:
         src, dst = os.path.join(d, "clips.npz"), os.path.join(d, "texts.json")
         np.savez(src, *clips)
-        cmd = resources.self_command() + ["--transcribe-clips", src, dst, "--threads", str(models.threads)]
+        cmd = resources.self_command() + ["--transcribe-clips", src, dst, "--threads", str(models.threads)] + \
+            (["--words"] if words else [])
         r = resources.run(cmd, capture_output=True, text=True, timeout=900)
         if r.returncode != 0 or not os.path.exists(dst):
             raise RuntimeError(f"расшифровка не удалась (код {r.returncode}): {(r.stderr or '')[-300:]}")
@@ -593,14 +611,16 @@ def speech_chunks_for_asr(segs, max_len=28.0, join_gap=1.5):
     return [(a, b) for a, b in out if b - a >= 0.3]
 
 
-def transcribe_full(models, wav16, segs, paragraph_gap=3.0, progress=None):
-    """The whole recording as text: every stretch of speech, a new paragraph after a longer pause."""
+def transcribe_full(models, wav16, segs, paragraph_gap=3.0, progress=None, words=False):
+    """The whole recording as text: every stretch of speech, a new paragraph after a longer pause.
+    words=True: (text, [[start, end, word, probability], …] with times in seconds of the recording)."""
     chunks = speech_chunks_for_asr(segs)
     if not chunks:
-        return ""
+        return ("", []) if words else ""
     clips = [np.ascontiguousarray(wav16[int(a * 16000):int(b * 16000)], dtype=np.float32) for a, b in chunks]
-    texts = (_transcribe_in_subprocess(models, clips) if models.asr_in_subprocess
-             else transcribe(models.asr(), clips, progress))
+    res = (_transcribe_in_subprocess(models, clips, words) if models.asr_in_subprocess
+           else transcribe(models.asr(), clips, progress, words))
+    texts = [r[0] for r in res] if words else res
     out, prev_end = [], None
     for (a, b), t in zip(chunks, texts):
         t = t.strip()
@@ -610,7 +630,144 @@ def transcribe_full(models, wav16, segs, paragraph_gap=3.0, progress=None):
             out.append("\n" if a - prev_end >= paragraph_gap else " ")
         out.append(t)
         prev_end = b
-    return "".join(out)
+    if not words:
+        return "".join(out)
+    return "".join(out), [[round(a + ws, 2), round(a + we, 2), w, p] for (a, _), (_, ww) in zip(chunks, res)
+                          for ws, we, w, p in ww]
+
+
+def excerpts_from_words(words, dur, n_excerpts=4, excerpt=45.0):
+    """The excerpts transcribe_excerpts would take (for the topic), from a transcript of the whole recording."""
+    if not words:
+        return ""
+    out = []
+    for k in range(n_excerpts):
+        s = max(0.0, dur * (k + 0.5) / n_excerpts - excerpt / 2)
+        e = min(dur, s + excerpt)
+        out.append(f"[{fmt_time(s)}] " + " ".join(w[2].strip() for w in words if s <= w[0] < e))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- phrases with listed words
+PHRASE_PAUSE = 0.8   # a pause this long between two words ends a phrase, even with no full stop heard
+PHRASE_MAX = 20.0    # a longer phrase (no full stop) is cut only from the comma or pause before the word to the one after
+CLAUSE_PAUSE = 0.4
+KIND_WORD = "фраза со словом"
+
+
+def word_list(text):
+    """"YouTube, Subscribe; like and subscribe, subscri*" -> ["youtube", "subscribe", "like and subscribe", "subscri*"]."""
+    out = []
+    for part in re.split(r"[,;\n]+", text or ""):
+        entry = " ".join(re.findall(r"[\w'*]+", part.lower().replace("’", "'")))
+        if entry.strip("*'") and entry not in out:
+            out.append(entry)
+    return out
+
+
+def _forms(w):
+    """A word with its endings: video -> videos, video's; subscribe -> subscribed, subscribing, subscribers."""
+    stem = w[:-1] if w.endswith("e") else w
+    out = {w, w + "s", w + "es", w + "'s", w + "s'", stem + "ed", stem + "ing", stem + "er", stem + "ers", stem + "er's"}
+    if len(w) > 2 and w.endswith("y") and w[-2] not in "aeiou":
+        out |= {w[:-1] + "ies", w[:-1] + "ied"}
+    return out
+
+
+def _token_test(token):
+    if token.endswith("*"):
+        head = token.rstrip("*")
+        return lambda u: u.startswith(head)
+    forms = _forms(token)
+    return forms.__contains__
+
+
+def _units(word):
+    """The words Whisper heard as one ("YouTube's," "follow-up") in lower case, without punctuation."""
+    return re.findall(r"[a-z0-9]+(?:'[a-z]+)?", word.lower().replace("’", "'"))
+
+
+def find_phrases(words, entries, dur, whole=True):
+    """Cuts for the listed words: [{start, end, word, reason}] with whole-second bounds (the sheet's timecodes),
+    put into the pauses around the phrase where the pauses allow. words: [[start, end, word, …]] of the recording;
+    whole: the whole phrase with the word (from the end of the previous sentence or pause to the next), else the word."""
+    if not words or not entries:
+        return []
+    units = [(i, u) for i, w in enumerate(words) for u in _units(w[2])]
+    tests = [[_token_test(t) for t in e.split()] for e in entries]
+    hits = []  # (first word, last word)
+    for k in range(len(units)):
+        for e, test in zip(entries, tests):
+            n = len(test)
+            if k + n <= len(units) and all(t(units[k + j][1]) for j, t in enumerate(test)):
+                hits.append((units[k][0], units[k + n - 1][0]))
+            elif n == 1 and "*" not in e and k + 1 < len(units) and test[0](units[k][1] + units[k + 1][1]):
+                hits.append((units[k][0], units[k + 1][0]))  # "you tube"
+    out = []
+    for i, j in sorted(set(hits)):
+        a, b = (_phrase(words, i, j) if whole else (i, j))
+        spoken = " ".join(w[2].strip(" ,.?!:;\"'…-") for w in words[i:j + 1])
+        s, e = _snap(words, a, b, dur)
+        if e > s and not (out and out[-1]["start"] == s and out[-1]["end"] == e):
+            out.append({"start": s, "end": e, "word": spoken,
+                        "reason": f"{KIND_WORD} «{spoken}»" if whole else f"слово «{spoken}»"})
+    return out
+
+
+def _phrase(words, i, j, pause=PHRASE_PAUSE, stops=".?!…"):
+    """The first and last word of the sentence around words i..j."""
+    def ends(k):
+        return words[k][2].rstrip(" \"')]”’»").endswith(tuple(stops)) or words[k + 1][0] - words[k][1] >= pause
+    a, b = i, j
+    while a > 0 and not ends(a - 1):
+        a -= 1
+    while b + 1 < len(words) and not ends(b):
+        b += 1
+    if words[b][1] - words[a][0] > PHRASE_MAX:
+        if stops == ".?!…":
+            return _phrase(words, i, j, CLAUSE_PAUSE, ".?!…,;:")
+        while words[a][0] < words[i][0] - PHRASE_MAX / 4:  # no commas either: a few seconds around the word
+            a += 1
+        while words[b][1] > words[j][1] + PHRASE_MAX / 4:
+            b -= 1
+    return a, b
+
+
+def _snap(words, a, b, dur):
+    """Whole seconds around words a..b: in the pause before / after them if a whole second falls there, else the
+    second that takes the least of the neighbouring words or leaves the least of these."""
+    s, e = words[a][0], words[b][1]
+    prev_end = words[a - 1][1] if a > 0 else 0.0
+    next_start = words[b + 1][0] if b + 1 < len(words) else dur
+    inside = [t for t in range(math.ceil(prev_end), math.floor(s) + 1)]
+    start = min(inside, key=lambda t: abs(t - (prev_end + s) / 2)) if inside else \
+        (math.floor(s) if prev_end - math.floor(s) <= math.ceil(s) - s else math.ceil(s))
+    inside = [t for t in range(math.ceil(e), math.floor(next_start) + 1)]
+    end = min(inside, key=lambda t: abs(t - (e + next_start) / 2)) if inside else \
+        (math.ceil(e) if math.ceil(e) - next_start <= e - math.floor(e) else math.floor(e))
+    start = 0.0 if a == 0 or start <= 1.0 else float(start)  # no words before: from the very beginning
+    end = dur if b == len(words) - 1 or end >= dur - 1.0 else float(end)
+    return start, end
+
+
+def merge_cuts(cuts, extra, dur, st):
+    """The cuts of the sound rules with more cuts added (phrases with listed words), joined as find_cuts joins its
+    own: closer than merge_gap, or less than min_keep of speech left between them."""
+    items = sorted([{"start": c["start"], "end": c["end"], "kinds": set(c["reasons"])} for c in cuts] +
+                   [{"start": x["start"], "end": x["end"], "kinds": {x["reason"]}} for x in extra],
+                   key=lambda x: x["start"])
+    merged = []
+    for ev in items:
+        if merged and ev["start"] - merged[-1]["end"] <= st.merge_gap:
+            merged[-1]["end"] = max(merged[-1]["end"], ev["end"])
+            merged[-1]["kinds"] |= ev["kinds"]
+        elif merged and ev["start"] - merged[-1]["end"] < st.min_keep:
+            merged[-1]["end"] = max(merged[-1]["end"], ev["end"])
+            merged[-1]["kinds"] |= ev["kinds"] | {KIND_LEFTOVER}
+        else:
+            merged.append(dict(ev))
+    return [{"start": float(m["start"]), "end": float(min(m["end"], dur)), "reasons": sorted(m["kinds"])}
+            for m in merged if min(m["end"], dur) > m["start"]]
 
 
 # ---------------------------------------------------------------- conversation or not
@@ -717,20 +874,29 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
     wav32 = load_audio(path, 32000)
     P, labels = tag_seconds(models, wav32, progress=lambda f: step(0.15 + 0.45 * f, "поиск музыки и шумов"))
     del wav32
-    step(0.6, "правила вырезки")
-    cuts, events, hints, speech_db, music_sec = find_cuts(wav16, dur, segs, P, labels, st)
+    step(0.5, "правила вырезки")
+    base_cuts, events, hints, speech_db, music_sec = find_cuts(wav16, dur, segs, P, labels, st)
     accent = None
     if st.accent:
-        step(0.62, "определение акцента")
+        step(0.52, "определение акцента")
         accent = accent_vote(models, wav16, speech_chunks(segs, music_sec, st))
     dialogue = None
     if st.dialogue:
-        step(0.7, "разговор или лекция")
+        step(0.58, "разговор или лекция")
         dialogue = dialogue_structure(models, wav16, segs)
+    entries, found, full_text, word_times = word_list(st.words), [], None, None
+    if entries:  # the whole recording with the time of each word; its text also serves as the transcript
+        step(0.64, "расшифровка речи")
+        full_text, word_times = transcribe_full(models, wav16, segs, words=True,
+                                                progress=lambda f: step(0.64 + 0.35 * f, "расшифровка речи"))
+        found = find_phrases(word_times, entries, dur, st.words_phrase)
+    cuts = merge_cuts(base_cuts, found, dur, st) if found else base_cuts
     transcript, topic = "", None
     if st.topic:
-        step(0.8, "расшифровка фрагментов для темы")
-        transcript = transcribe_excerpts(models, wav16, dur, segs)
+        if word_times is None:
+            step(0.8, "расшифровка фрагментов для темы")
+        transcript = (excerpts_from_words(word_times, dur) if word_times is not None
+                      else transcribe_excerpts(models, wav16, dur, segs))
         topic = topic_score(transcript)
     step(1.0, "готово")
     return {
@@ -739,8 +905,13 @@ def analyze(path, models, settings=None, progress=None, cancelled=None):
         "speech_ratio": round(sum(e - s for s, e in segs) / max(dur, 1e-9), 3),
         "speech_db": round(speech_db, 1),
         "cuts": cuts,
+        "base_cuts": base_cuts,  # without the phrases: the words found again when the list changes
+        "words": {"list": entries, "phrase": st.words_phrase, "found": found} if entries else None,
+        "full_text": full_text,    # the window moves these two into their own files
+        "word_times": word_times,
         "timecodes": format_cuts([(c["start"], c["end"]) for c in cuts], dur),
-        "hints": [{"start": h["start"], "end": h["end"], "kind": h["kind"]} for h in hints],
+        "hints": [{"start": h["start"], "end": h["end"], "kind": h["kind"]} for h in hints
+                  if not any(c["start"] <= h["start"] and h["end"] <= c["end"] for c in cuts)],
         "accent": accent,
         "topic": topic,
         "transcript": transcript,
