@@ -91,19 +91,33 @@ class PoolSignals(QObject):
 
 
 class Worker(QThread):
-    """Runs cuts, or table and row-search jobs, one after another, away from the UI thread."""
+    """Runs cuts, or table and row-search jobs, away from the UI thread: one after another, or `threads` at a time
+    (cuts: most of a cut is waiting for the disk and for the table's answer)."""
     progress = Signal(int, float, str)
     done = Signal(int, str, object)
     failed = Signal(int, str, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, threads=1):
         super().__init__(parent)
         self.jobs = queue.Queue()
-        self.cancel_flag = threading.Event()
+        self.threads = max(1, threads)
+        self.lock = threading.Lock()
         self.pending = 0
+        self._running = set()  # the cancel flags of the jobs being done
+        self._local = threading.local()
+        self._extra = []
+
+    @property
+    def cancel_flag(self):
+        """The flag of the job this thread is doing: "Остановить" sets it."""
+        flag = getattr(self._local, "flag", None)
+        if flag is None:
+            flag = self._local.flag = threading.Event()
+        return flag
 
     def add(self, fid, kind, payload):
-        self.pending += 1
+        with self.lock:
+            self.pending += 1
         self.jobs.put((fid, kind, payload))
 
     def cancel_all(self):
@@ -111,24 +125,39 @@ class Worker(QThread):
         try:
             while True:
                 dropped.append(self.jobs.get_nowait())
-                self.pending -= 1
+                with self.lock:
+                    self.pending -= 1
         except queue.Empty:
             pass
-        self.cancel_flag.set()
+        with self.lock:
+            for flag in self._running:
+                flag.set()
         return dropped
 
     def stop(self):
         self.cancel_all()
-        self.jobs.put((0, "quit", None))
+        for _ in range(self.threads):
+            self.jobs.put((0, "quit", None))
         self.wait(5000)
+        for t in self._extra:
+            t.join(5)
 
     def run(self):
+        self._extra = [threading.Thread(target=self._loop, daemon=True, name=f"worker-{i}")
+                       for i in range(1, self.threads)]
+        for t in self._extra:
+            t.start()
+        self._loop()
+
+    def _loop(self):
         while True:
             fid, kind, payload = self.jobs.get()
             if kind == "quit":
                 return
-            self.cancel_flag.clear()
-            report = lambda f, t: self.progress.emit(fid, float(f), t)  # noqa: E731
+            flag = self._local.flag = threading.Event()
+            with self.lock:
+                self._running.add(flag)
+            report = lambda f, t, fid=fid: self.progress.emit(fid, float(f), t)  # noqa: E731
             try:
                 if kind == "match":
                     res = self._match(payload, report)
@@ -167,7 +196,9 @@ class Worker(QThread):
             except Exception as e:  # shown to the user, details go to the log
                 self.failed.emit(fid, kind, f"{e}\n\n{traceback.format_exc(limit=3)}")
             finally:
-                self.pending -= 1
+                with self.lock:
+                    self._running.discard(flag)
+                    self.pending -= 1
 
 
     def _match(self, payload, report):
@@ -884,6 +915,7 @@ CELL_MAX = 49000  # a Google Sheets cell holds at most 50 000 characters
 TEXTS_PER_WRITE = 20
 SHORT_WHY = {"НЕ РАЗГОВОР": "не разговор", "НЕ МЕДИЦИНСКАЯ ТЕМА": "не медицина"}
 MATCH_EVERY = 20  # seconds between row searches started by themselves (new files from the downloader)
+CUT_THREADS = 4   # files cut at a time: a cut is mostly waiting (the disk, the table's answer), not the processor
 WAIT_ROW = "ждёт номера строки"       # rows are chosen for the analysis and this file's row is not known yet
 OUT_OF_ROWS = "вне выбранных строк"  # ...and its row is not among them: it waits
 
@@ -942,6 +974,7 @@ class MainWindow(QMainWindow):
         self._dialogue_pending = set()  # files whose conversation check is queued
         self._text_pending = set()      # files whose transcription is queued
         self._analysis_pending = set()  # files whose analysis is queued or running
+        self._cut_outputs = {}          # file -> the name its queued or running cut will save
         self._names_dialog = None
         self.seen = self._load_seen()   # every file ever added: the downloads folder gives each only once
         self._texts_in_flight = set()   # transcripts being written to the table
@@ -960,7 +993,7 @@ class MainWindow(QMainWindow):
         if self._watched():
             self.watch_timer.start()
 
-        self.worker = Worker(self)  # cuts, one after another
+        self.worker = Worker(self, threads=CUT_THREADS)  # cuts, several at a time
         self.net = Worker(self)     # row search and table writes: network only, runs next to the analysis
         self.pool_signals = PoolSignals(self)
         for w in (self.worker, self.net, self.pool_signals):
@@ -2113,11 +2146,15 @@ class MainWindow(QMainWindow):
         return upd if len(upd) > 1 else None
 
     def _row_output(self, it, ext):
+        """<row><ext> in the results folder; a name another file has, or will have once its queued cut is done, gets
+        " (2)", " (3)"…"""
         folder = self.extra.get("out_dir") or os.path.join(os.path.dirname(it["path"]), "готово")
-        name = f"{it['row']}{ext}"
-        out = os.path.join(folder, name)
-        if os.path.exists(out) and os.path.abspath(out) != os.path.abspath((it.get("cut") or {}).get("output") or "."):
-            out = cutter.default_output(out, ext, suffix="", out_dir=folder)
+        own = norm_path((it.get("cut") or {}).get("output") or ".")
+        taken = {norm_path(p) for p in self._cut_outputs.values()}
+        out, n = os.path.join(folder, f"{it['row']}{ext}"), 2
+        while (os.path.exists(out) or norm_path(out) in taken) and norm_path(out) != own:
+            out = os.path.join(folder, f"{it['row']} ({n}){ext}")
+            n += 1
         return out
 
     def _remember_written(self, upd):
@@ -2264,6 +2301,7 @@ class MainWindow(QMainWindow):
             return  # nothing to cut and no row to name it after
         upd = self._sheet_update(it, tc)
         info = self.sheet_rows.get(it.get("row")) if it.get("row") else None
+        self._cut_outputs[fid] = out
         it["status"] = "в очереди на вырезание"
         self._refresh_row(fid)
         self.worker.add(fid, "cut", {"path": it["path"], "cuts": cuts, "tc": tc, "mode": mode, "out_path": out,
@@ -2341,6 +2379,8 @@ class MainWindow(QMainWindow):
                     self.items[fid]["status"] = "остановлено"
                 self._refresh_row(fid)
         for fid, kind, _ in self.worker.cancel_all() + self.net.cancel_all():
+            if kind == "cut":
+                self._cut_outputs.pop(fid, None)
             if kind == "match":
                 self._match_queued = False
             elif kind == "rows":
@@ -2375,6 +2415,8 @@ class MainWindow(QMainWindow):
     def on_done(self, fid, kind, res):
         if kind == "analyze":
             self._analysis_pending.discard(fid)
+        elif kind == "cut":
+            self._cut_outputs.pop(fid, None)
         if kind == "compact":
             msg = f"Готово: расшифровок и других строк {res.get('rows', 0)}, пустых строк убрано {res.get('removed', 0)}."
             if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
@@ -2519,6 +2561,8 @@ class MainWindow(QMainWindow):
     def on_failed(self, fid, kind, msg):
         if kind == "analyze":
             self._analysis_pending.discard(fid)
+        elif kind == "cut":
+            self._cut_outputs.pop(fid, None)
         if kind == "compact":
             if self._downloader_dialog is not None and hasattr(self._downloader_dialog, "compacted"):
                 self._downloader_dialog.compacted(f"Не получилось: {msg.splitlines()[0]}")

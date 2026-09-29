@@ -2,7 +2,7 @@
 import os
 import sys
 
-__version__ = "1.8.3"
+__version__ = "1.8.4"
 
 # torch and CTranslate2 each bundle Intel's OpenMP runtime (Windows, Intel Macs); loading the
 # second copy aborts the process unless this is set before either library is imported

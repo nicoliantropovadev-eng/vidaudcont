@@ -559,6 +559,47 @@ def test_a_file_cut_whole_is_done_quietly(tmp_path, monkeypatch):
         sheet.close()
 
 
+def test_several_files_are_cut_at_once_and_never_share_a_name(tmp_path, monkeypatch):
+    """Cuts run several at a time; two files given the same row by hand get "2.m4a" and "2 (2).m4a" instead of the
+    second overwriting the first."""
+    app = QApplication.instance() or QApplication([])
+    fresh_app_state()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: pytest.fail(f"a window: {a[2] if len(a) > 2 else a}"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    from vidaudcont.gui.main_window import MainWindow, Worker
+    running, peak, lock = [0], [0], threading.Lock()
+    real = Worker._cut
+
+    def slow_cut(self, payload, report):  # as if the disk and the table took their time
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        try:
+            time.sleep(0.5)
+            return real(self, payload, report)
+        finally:
+            with lock:
+                running[0] -= 1
+    monkeypatch.setattr(Worker, "_cut", slow_cut)
+    w = MainWindow()
+    w.settings.words, w.settings.only_suitable = "", False
+    res = {"duration": 76.0, "speech_ratio": 0.8, "timecodes": "start-0:05", "segments": [], "hints": [],
+           "cuts": [{"start": 0.0, "end": 5.0, "reasons": ["x"]}], "transcript": "", "accent": None, "topic": None,
+           "dialogue": None}
+    fids = []
+    for i, row in enumerate((2, 2, 3, 4, 5)):
+        src = tmp_path / f"f{i}.m4a"
+        shutil.copy(resources.asset("selftest.m4a"), src)
+        fids.append(w._add_item(str(src), {"status": "готово", "result": dict(res), "row": row, "row_how": "вручную"}))
+    w.cut_all()
+    wait(app, lambda: all(w.items[f].get("cut") for f in fids) and w.worker.pending == 0, timeout=120)
+    assert peak[0] > 1 and not w._cut_outputs
+    assert sorted(os.listdir(tmp_path / "готово")) == ["2 (2).m4a", "2.m4a", "3.m4a", "4.m4a", "5.m4a"]
+    assert all(w.items[f]["cut"]["verification"]["lossless"] for f in fids)
+    w.close()
+
+
 def test_red_rows_and_repeats_are_skipped(tmp_path, monkeypatch):
     """A row marked red is left alone; of two downloads of the same video only one is used; repeated links
     get "ПОВТОР строки N" in column E from the downloader dialog."""
